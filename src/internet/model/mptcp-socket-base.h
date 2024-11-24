@@ -509,8 +509,9 @@ protected:
 
 private:
   uint64_t m_peerKey; //!< Store remote host token
-  bool     m_doChecksum;  //!< Compute the checksum. Negociated during 3WHS. Unused
+  bool     m_doChecksum;  //!< Compute the checksum. Negociated during 3WHS. Unused 
   bool     m_receivedDSS;  //!< True if we received at least one DSS
+  bool     m_outOfOrderDss;  // DSS out-of-orderを検出したフラグ  
   bool     m_multipleSubflows; //!< true if required number of subflows have been created [KN]
   double   fLowStartTime;
 
@@ -533,6 +534,7 @@ private:
   //!
   TypeId m_subflowTypeId;
   TypeId m_schedulerTypeId;
+  SequenceNumber64 m_expectedDsn;
 };
 
 }   //namespace ns3

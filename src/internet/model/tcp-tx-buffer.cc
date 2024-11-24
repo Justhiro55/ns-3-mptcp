@@ -1339,35 +1339,41 @@ TcpTxBuffer::MarkHeadAsLost ()
 void
 TcpTxBuffer::AddRenoSack (void)
 {
-  NS_LOG_FUNCTION (this);
-  NS_ASSERT (m_sentList.size () > 1);
+  NS_LOG_FUNCTION(this);
+  
+  // Check if we have enough segments to add a SACK
+  if (m_sentList.size() <= 1)
+  {
+    NS_LOG_LOGIC("Not enough segments in sent list to add Reno SACK");
+    return;
+  }
 
   m_renoSack = true;
 
   // We can _never_ SACK the head, so start from the second segment sent
-  auto it = ++m_sentList.begin ();
+  auto it = ++m_sentList.begin();
 
   // Find the "highest sacked" point, that is SND.UNA + m_sackedOut
-  while (it != m_sentList.end () && (*it)->m_sacked)
+  while (it != m_sentList.end() && (*it)->m_sacked)
     {
       ++it;
     }
 
   // Add to the sacked size the size of the first "not sacked" segment
-  if (it != m_sentList.end ())
+  if (it != m_sentList.end())
     {
       (*it)->m_sacked = true;
-      m_sackedOut += (*it)->m_packet->GetSize ();
-      m_highestSack = std::make_pair (it, (*it)->m_startSeq);
-      NS_LOG_INFO ("Added a Reno SACK, status: " << *this);
+      m_sackedOut += (*it)->m_packet->GetSize();
+      m_highestSack = std::make_pair(it, (*it)->m_startSeq);
+      NS_LOG_INFO("Added a Reno SACK, status: " << *this);
     }
   else
     {
-      NS_LOG_INFO ("Can't add a Reno SACK because we miss segments. This dupack"
+      NS_LOG_INFO("Can't add a Reno SACK because we miss segments. This dupack"
                    " should be arrived from spurious retransmissions");
     }
 
-  ConsistencyCheck ();
+  ConsistencyCheck();
 }
 
 void

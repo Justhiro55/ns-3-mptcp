@@ -169,10 +169,28 @@ MpTcpSubflow::MpTcpSubflow(const MpTcpSubflow& sock)
 
 MpTcpSubflow::MpTcpSubflow()
   : TcpSocketBase(),
-    m_metaSocket(0),
+    // DSS関連のメンバ変数
+    m_dssFlags(0),
+    m_dssMapping(),
+
+    // DSN追跡用のメンバ変数
+    m_expectedDsn(SequenceNumber64(0)),
+    m_gotFirstDsn(false),
+    m_expectedDsnOffset(0),
+    m_highestSeenDsn(SequenceNumber64(0)),
+
+    // 順序管理用のメンバ変数
+    m_inOrderDsn(),
+    m_outOfOrderDsn(),
+    m_missingSegments(),
+
+    // その他のメンバ変数
     m_masterSocket(false),
     m_backupSubflow(false),
-    m_localNonce(0)
+    m_localNonce(0),
+    m_duplicateAckCount(0),
+    m_prefixCounter(0),
+    m_metaSocket(nullptr)
 {
   NS_LOG_FUNCTION(this);
 }
@@ -844,71 +862,67 @@ MpTcpSubflow::AppendDSSFin()
   m_dssFlags |= TcpOptionMpTcpDSS::DataFin;
 }
 
-void
+void 
 MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
 {
-  NS_LOG_FUNCTION (this << tcpHeader);
+  NS_LOG_FUNCTION(this << tcpHeader);
+  
+  NS_LOG_INFO("Received data - SSN=" << tcpHeader.GetSequenceNumber() 
+              << " Size=" << p->GetSize()
+              << " NextRxSeq=" << m_rxBuffer->NextRxSequence());
+
   MpTcpMapping mapping;
   bool sendAck = false;
 
-  // OutOfRange
-  // If cannot find an adequate mapping, then it should [check RFC]
-  if(!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping) )
-   {
-     m_RxMappings.Dump();
-     NS_FATAL_ERROR("Could not find mapping associated ");
-     return;
-   }
-  // Put into Rx buffer
+  // マッピング検索
+  if(!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping)) {
+    NS_LOG_ERROR("No mapping found for SSN=" << tcpHeader.GetSequenceNumber());
+    m_RxMappings.Dump();
+    return;
+  }
+
+  // バッファに追加
   SequenceNumber32 expectedSSN = m_rxBuffer->NextRxSequence();
-  if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber()))
-    { // Insert failed: No data or RX buffer full
-      NS_LOG_WARN("Insert failed, No data (" << p->GetSize() << ") ?");
+  if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+    NS_LOG_WARN("Failed to add to rx buffer - Size=" << p->GetSize() 
+                << " Available=" << m_rxBuffer->Available());
+    
+    AppendDSSAck();
+    SendEmptyPacket(TcpHeader::ACK);
+    return;
+  }
 
-      m_rxBuffer->Dump();
-      AppendDSSAck();
-      SendEmptyPacket(TcpHeader::ACK);
-      return;
-    }
+  NS_LOG_INFO("Buffer state after add - Size=" << m_rxBuffer->Size() 
+              << " Available=" << m_rxBuffer->Available()
+              << " NextRxSeq=" << m_rxBuffer->NextRxSequence());
 
-  // Size() = Get the actual buffer occupancy
-  if (m_rxBuffer->Size() > m_rxBuffer->Available() /* Out of order packets exist in buffer */
-    || m_rxBuffer->NextRxSequence() > expectedSSN + p->GetSize() /* or we filled a gap */
-    )
-    { // A gap exists in the buffer, or we filled a gap: Always ACK
+  // Out-of-orderパケットの処理
+  if (m_rxBuffer->Size() > m_rxBuffer->Available() || 
+      m_rxBuffer->NextRxSequence() > expectedSSN + p->GetSize()) {
+    NS_LOG_INFO("Out of order data detected");
+    sendAck = true;
+  }
+  
+  // アプリケーションへの通知
+  if (expectedSSN < m_rxBuffer->NextRxSequence()) {
+    NS_LOG_INFO("Notifying application of new data");
+    if (!m_shutdownRecv) {
+      GetMeta()->OnSubflowRecv(this);
       sendAck = true;
     }
-  else
-    { 
-      sendAck = true;
+
+    if (m_rxBuffer->Finished() && (tcpHeader.GetFlags() & TcpHeader::FIN) == 0) {
+      NS_LOG_INFO("All data received - initiating peer close");
+      DoPeerClose();
     }
-  // Notify app to receive if necessary
-  if (expectedSSN < m_rxBuffer->NextRxSequence())
-    { // NextRxSeq advanced, we have something to send to the app
-      if (!m_shutdownRecv)
-        {
-          GetMeta()->OnSubflowRecv( this );
-          sendAck = true;
-        }
-      // Handle exceptions
-      if (m_closeNotified)
-        {
-          NS_LOG_WARN ("Why TCP " << this << " got data after close notification?");
-        }
-      // If we received FIN before and now completed all "holes" in rx buffer,
-      // invoke peer close procedure
-      if (m_rxBuffer->Finished() && (tcpHeader.GetFlags() & TcpHeader::FIN) == 0)
-        {
-          DoPeerClose();
-        }
-    }
-  // For now we always sent an ack
-  // should be always true hack to allow compilation
-  if (sendAck)
-    {
-      SendEmptyPacket(TcpHeader::ACK);
-    }
+  }
+
+  if (sendAck) {
+    NS_LOG_INFO("Sending ACK");
+    SendEmptyPacket(TcpHeader::ACK);
+  }
 }
+
 
 uint32_t
 MpTcpSubflow::UnAckDataCount() const
@@ -965,45 +979,6 @@ MpTcpSubflow::ClosingOnEmpty(TcpHeader& header)
   GetMeta()->OnSubflowClosing(this);
 }
 
-int
-MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS> dss)
-{
-  NS_LOG_FUNCTION (this << dss << " from subflow ");
-
-  if(!GetMeta()->FullyEstablished() )
-  {
-    NS_LOG_LOGIC("First DSS received !");
-    GetMeta()->BecomeFullyEstablished();
-  }
-
-  //! datafin case handled at the start of the function
-  if( (dss->GetFlags() & TcpOptionMpTcpDSS::DSNMappingPresent) && !dss->DataFinMappingOnly() )
-  {
-    MpTcpMapping m;
-    //Get mapping n'est utilisé qu'une fois, copier le code ici
-    m = GetMapping(dss);
-    // Add peer mapping
-    bool ok = m_RxMappings.AddMapping( m );
-    if(!ok)
-      {
-        NS_LOG_WARN("Could not insert mapping: already received ?");
-        NS_LOG_UNCOND("Dumping Rx mappings...");
-        m_RxMappings.Dump();
-      }
-  }
-  if ( dss->GetFlags() & TcpOptionMpTcpDSS::DataFin)
-  {
-    NS_LOG_LOGIC("DFIN detected " << dss->GetDataFinDSN());
-    GetMeta()->PeerClose( SequenceNumber32(dss->GetDataFinDSN()), this);
-  }
-
-  if( dss->GetFlags() & TcpOptionMpTcpDSS::DataAckPresent)
-  {
-    GetMeta()->ReceivedAck( SequenceNumber32(dss->GetDataAck()), this, false);
-  }
-  return 0;
-}
-
 /* Upon ack receival we need to act depending on if it's new or not
    if it's new it may allow us to discard a mapping
    otherwise notify meta of duplicate
@@ -1019,5 +994,118 @@ MpTcpSubflow::ReceivedAck(Ptr<Packet> p, const TcpHeader& header)
   // We should consider more advanced schemes
   AppendDSSAck();
 }
+
+int 
+MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS> dss)
+{
+  NS_LOG_FUNCTION(this << dss << " from subflow ");
+
+  if(!GetMeta()->FullyEstablished())
+  {
+    NS_LOG_LOGIC("First DSS received!");
+    GetMeta()->BecomeFullyEstablished();
+  }
+
+  if((dss->GetFlags() & TcpOptionMpTcpDSS::DSNMappingPresent) && !dss->DataFinMappingOnly())
+  {
+    MpTcpMapping mapping = GetMapping(dss);
+    
+    // Check DSS integrity
+    if(!CheckDssIntegrity(mapping))
+    {
+      NS_LOG_WARN("DSS integrity check failed - sending duplicate ACK");
+      AppendDSSAck();
+      SendEmptyPacket(TcpHeader::ACK); 
+      return 0;
+    }
+
+    // Add mapping
+    bool ok = m_RxMappings.AddMapping(mapping);
+    if(!ok)
+    {
+      NS_LOG_WARN("Could not insert mapping: already received?");
+      m_RxMappings.Dump();
+    }
+  }
+
+  if(dss->GetFlags() & TcpOptionMpTcpDSS::DataFin)
+  {
+    NS_LOG_LOGIC("DFIN detected " << dss->GetDataFinDSN());
+    GetMeta()->PeerClose(SequenceNumber32(dss->GetDataFinDSN()), this);
+  }
+
+  if(dss->GetFlags() & TcpOptionMpTcpDSS::DataAckPresent)
+  {
+    GetMeta()->ReceivedAck(SequenceNumber32(dss->GetDataAck()), this, false);
+  }
+
+  return 0;
+}
+
+
+bool MpTcpSubflow::CheckDssIntegrity(const MpTcpMapping& mapping) 
+{
+  NS_LOG_FUNCTION(this << "DSN=" << mapping.HeadDSN() 
+                      << " SSN=" << mapping.HeadSSN()
+                      << " Length=" << mapping.GetLength());
+
+  // 最初のマッピングを受信した時
+  if(!m_gotFirstDsn) {
+    m_highestSeenDsn = mapping.HeadDSN();
+    // 次に期待するDSNは、現在のDSN + データ長
+    m_expectedDsn = mapping.HeadDSN() + mapping.GetLength();
+    m_gotFirstDsn = true;
+    
+    NS_LOG_INFO("First DSN received - HighestSeen=" << m_highestSeenDsn 
+                << " Next Expected=" << m_expectedDsn);
+    
+    return m_RxMappings.AddMapping(mapping);
+  }
+
+  // DSNの連続性チェック
+  if(mapping.HeadDSN() < m_expectedDsn) {
+    // すでに受信済みのデータ
+    NS_LOG_WARN("Old DSN received - Expected: " << m_expectedDsn 
+                << " Got: " << mapping.HeadDSN());
+    return false;
+  }
+
+  if(mapping.HeadDSN() > m_expectedDsn) {
+    // ギャップ検出
+    uint64_t gap = mapping.HeadDSN().GetValue() - m_expectedDsn.GetValue();
+    
+    NS_LOG_WARN("DSN gap detected - Expected: " << m_expectedDsn 
+                << " Got: " << mapping.HeadDSN()
+                << " Gap: " << gap
+                << " HighestSeen: " << m_highestSeenDsn);
+
+    // ギャップ情報を保存
+    m_missingSegments[m_expectedDsn] = mapping.HeadDSN()-1;
+    
+    // DupAckカウント更新
+    m_duplicateAckCount++;
+    if(m_duplicateAckCount >= 3) {
+      GetMeta()->OnSubflowDupack(this, mapping);
+      m_duplicateAckCount = 0;
+    }
+
+    // 最大DSN更新
+    if(mapping.HeadDSN() > m_highestSeenDsn) {
+      m_highestSeenDsn = mapping.HeadDSN();
+      // 次に期待するDSNを更新
+      m_expectedDsn = m_highestSeenDsn + mapping.GetLength();
+    }
+    
+    return m_RxMappings.AddMapping(mapping);
+  }
+
+  // 期待通りのDSNを受信
+  m_highestSeenDsn = mapping.HeadDSN();
+  m_expectedDsn = m_highestSeenDsn + mapping.GetLength();
+  m_duplicateAckCount = 0;
+
+  return m_RxMappings.AddMapping(mapping);
+}
+
 
 } // end of ns3

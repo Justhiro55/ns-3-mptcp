@@ -972,38 +972,72 @@ MpTcpSocketBase::Retransmit()
 }
 
 void
-MpTcpSocketBase::DoRetransmit()
+MpTcpSocketBase::DoRetransmit(void)
 {
   NS_LOG_FUNCTION (this);
-  // Retransmit SYN packet
-  if (m_state == SYN_SENT)
-    {
-      if (m_synCount > 0)
-        {
-          NS_FATAL_ERROR("TODO, first syn didn't reach it should be resent. Maybe this shoudl be let to the subflow");
-        }
-      else
-        {
-          NotifyConnectionFailed();
-        }
-      return;
-    }
 
-  // Retransmit non-data packet: Only if in FIN_WAIT_1 or CLOSING state
-  if (m_txBuffer->Size() == 0)
-    {
-      if (m_state == FIN_WAIT_1 || m_state == CLOSING)
-        {
-          // Must have lost FIN, re-send
-          TcpHeader header;
-          SendFin();
-        }
-      return;
+  // 再送対象のサブフローを選択 
+  Ptr<MpTcpSubflow> subflow = nullptr;
+  Time minRtt = Time::Max();
+  
+  for(int i = 0; i < (int)GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    // TcpSocketBaseから継承したRTT推定値を使用
+    Time rtt = sf->m_rtt->GetEstimate();
+    if(rtt < minRtt) {
+      minRtt = rtt; 
+      subflow = sf;
     }
-  // Retransmit a data packet: Call SendDataPacket
-  NS_LOG_LOGIC ("TcpSocketBase " << this << " retxing seq " << m_txBuffer->HeadSequence ());
-  DumpRxBuffers(0);
-  NS_FATAL_ERROR("TODO later, but for the tests only, it should not be necesssary ?! Check for anything suspicious");
+  }
+
+  if(!subflow) {
+    NS_LOG_WARN("No suitable subflow for retransmission");
+    return;
+  }
+
+  // 再送データの準備
+  SequenceNumber32 seq = m_txBuffer->HeadSequence();
+  uint32_t size = m_txBuffer->SizeFromSequence(seq);
+
+  if(size == 0) {
+    NS_LOG_INFO("Nothing to retransmit");
+    return;
+  }
+
+  // マッピング情報を更新して再送 
+  MpTcpMapping mapping;
+  mapping.SetHeadDSN(SEQ32TO64(seq));
+  mapping.SetMappingSize(size);
+  mapping.MapToSSN(subflow->FirstUnmappedSSN());
+  
+  bool ok = subflow->AddLooseMapping(mapping.HeadDSN(), mapping.GetLength());
+  if(!ok) {
+    NS_LOG_ERROR("Could not add mapping for retransmission");
+    return;
+  }
+
+  // 再送データを選択したサブフローで送信
+  NS_LOG_INFO("Retransmitting " << size << " bytes on subflow " << subflow);
+  subflow->SendPendingData(true);
+
+  // 再送タイマーの更新
+  if (!m_retxEvent.IsExpired()) {
+    m_retxEvent.Cancel();
+  }
+
+  // TcpSocketBaseから継承したm_rtoを使用
+  m_retxEvent = Simulator::Schedule(subflow->m_rto.Get(), &MpTcpSocketBase::ReTxTimeout, this);
+
+  // 次の再送タイムアウト値を指数バックオフで計算
+  // TracedValueからTimeを取得して比較
+  Time currentRto = subflow->m_rto.Get();
+  Time maxRto = Seconds(60);
+  Time newRto = currentRto * 2;
+  
+  if (newRto > maxRto) {
+    newRto = maxRto;
+  }
+  subflow->m_rto = newRto;
 }
 
 void
@@ -1333,34 +1367,52 @@ MpTcpSocketBase::CloseAllSubflows()
 
 void
 MpTcpSocketBase::ReceivedAck(
-  SequenceNumber32 dack
-  , Ptr<MpTcpSubflow> sf
-  , bool count_dupacks
-  )
+  SequenceNumber32 dack,
+  Ptr<MpTcpSubflow> sf, 
+  bool count_dupacks)
 {
-  NS_LOG_FUNCTION("Received DACK " << dack << "from subflow" << sf << "(Enable dupacks:" << count_dupacks << " )");
+  NS_LOG_FUNCTION("Received DACK " << dack << "from subflow=" << sf << 
+                  "(Enable dupacks:" << count_dupacks << " )");
 
-  if (dack < m_txBuffer->HeadSequence ())
-    { // Case 1: Old ACK, ignored.
-      NS_LOG_LOGIC ("Old ack Ignored " << dack  );
+  if (dack < m_txBuffer->HeadSequence()) {
+    // Case 1: Old ACK, ignored
+    NS_LOG_LOGIC("Old ack Ignored " << dack);
+    return;
+  }
+
+  if (dack == m_txBuffer->HeadSequence()) {
+    // Case 2: Potentially a duplicated ACK
+    if (dack < m_tcb->m_nextTxSequence && count_dupacks) {
+      m_dupAckCount++;
+      if (m_dupAckCount >= 3) {
+        // Fast Retransmit
+        DoRetransmit();
+        m_dupAckCount = 0;
+      }
     }
-  else if (dack  == m_txBuffer->HeadSequence ())
-    { // Case 2: Potentially a duplicated ACK
-      if (dack  < m_tcb->m_nextTxSequence && count_dupacks)
-        {
-        /* dupackcount shall only be increased if there is only a DSS option ! */
-        }
-      // otherwise, the ACK is precisely equal to the nextTxSequence
-      NS_ASSERT( dack  <= m_tcb->m_nextTxSequence);
-    }
-  else if (dack  > m_txBuffer->HeadSequence ())
-    { // Case 3: New ACK, reset m_dupAckCount and update m_txBuffer
-      NS_LOG_LOGIC ("New DataAck [" << dack  << "]");
-      m_txBuffer->DiscardUpTo( dack );
-      bool resetRTO = true;
-      NewAck( dack, resetRTO );
-      m_dupAckCount = 0;
-    }
+    return;
+  }
+
+  // Case 3: New ACK
+  NS_LOG_LOGIC("New DataAck [" << dack << "]");
+  
+  // バッファからデータを破棄
+  m_txBuffer->DiscardUpTo(dack);
+  
+  // 再送タイマーをリセット
+  bool resetRTO = true;
+  NewAck(dack, resetRTO);
+  
+  // 重複ACKカウントをリセット
+  m_dupAckCount = 0;
+
+  // ウィンドウサイズを更新
+  if (dack > m_tcb->m_nextTxSequence) {
+    m_tcb->m_nextTxSequence = dack;
+  }
+
+  // 新しいデータを送信可能な場合は送信
+  SendPendingData(false);
 }
 
 /* Move TCP to Time_Wait state and schedule a transition to Closed state */
