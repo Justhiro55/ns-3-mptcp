@@ -108,6 +108,8 @@ public:
    * \brief Should be called only by subflows when they update their receiver window
    */
   virtual bool UpdateWindowSize(const TcpHeader& header);
+  void NotifyDsnGap(SequenceNumber64 expected, SequenceNumber64 received);
+  void CheckSubflowsForMissingData(SequenceNumber64 expectedDsn, SequenceNumber64 receivedDsn);
 
 protected:
    ////////////////////////////////////////////
@@ -125,7 +127,45 @@ protected:
   virtual void OnSubflowConnectionSuccess (Ptr<Socket> socket);
 
 public:
+  struct DsnState {
+    SequenceNumber64 globalDsn;      // グローバルDSN
+    SequenceNumber64 lastSeenDsn;    // 最後に見たDSN
+    SequenceNumber64 expectedDsn;    // 次に期待するDSN
+    bool initialized;                // 初期化済みフラグ
 
+    DsnState() :
+      globalDsn(0),
+      lastSeenDsn(0),
+      expectedDsn(0),
+      initialized(false)
+    {}
+
+    // DSNの連続性をチェック
+    bool IsNextExpectedDsn(SequenceNumber64 dsn) const {
+      return dsn == expectedDsn;
+    }
+
+    // ギャップチェック
+    bool HasGap(SequenceNumber64 dsn, uint32_t& gapSize) const {
+      if (dsn > expectedDsn) {
+        gapSize = dsn.GetValue() - expectedDsn.GetValue();
+        return true;
+      }
+      return false;
+    }
+
+    // DSN更新
+    void UpdateDsn(SequenceNumber64 dsn, uint32_t length) {
+      if (dsn > globalDsn) {
+        globalDsn = dsn;
+      }
+      lastSeenDsn = dsn;
+      expectedDsn = dsn + length;
+    }
+  };
+  DsnState& GetDsnState() { return m_dsnState; }
+
+  DsnState m_dsnState;
   virtual void SetPathManager(PathManagerMode); 
   /**
    * Create a subflow for ndiffports path manager

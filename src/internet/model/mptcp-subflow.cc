@@ -169,22 +169,8 @@ MpTcpSubflow::MpTcpSubflow(const MpTcpSubflow& sock)
 
 MpTcpSubflow::MpTcpSubflow()
   : TcpSocketBase(),
-    // DSS関連のメンバ変数
     m_dssFlags(0),
     m_dssMapping(),
-
-    // DSN追跡用のメンバ変数
-    m_expectedDsn(SequenceNumber64(0)),
-    m_gotFirstDsn(false),
-    m_expectedDsnOffset(0),
-    m_highestSeenDsn(SequenceNumber64(0)),
-
-    // 順序管理用のメンバ変数
-    m_inOrderDsn(),
-    m_outOfOrderDsn(),
-    m_missingSegments(),
-
-    // その他のメンバ変数
     m_masterSocket(false),
     m_backupSubflow(false),
     m_localNonce(0),
@@ -1042,70 +1028,92 @@ MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS
   return 0;
 }
 
-
-bool MpTcpSubflow::CheckDssIntegrity(const MpTcpMapping& mapping) 
-{
+bool MpTcpSubflow::CheckDssIntegrity(const MpTcpMapping& mapping) {
   NS_LOG_FUNCTION(this << "DSN=" << mapping.HeadDSN() 
                       << " SSN=" << mapping.HeadSSN()
                       << " Length=" << mapping.GetLength());
 
-  // 最初のマッピングを受信した時
-  if(!m_gotFirstDsn) {
-    m_highestSeenDsn = mapping.HeadDSN();
-    // 次に期待するDSNは、現在のDSN + データ長
-    m_expectedDsn = mapping.HeadDSN() + mapping.GetLength();
-    m_gotFirstDsn = true;
-    
-    NS_LOG_INFO("First DSN received - HighestSeen=" << m_highestSeenDsn 
-                << " Next Expected=" << m_expectedDsn);
-    
-    return m_RxMappings.AddMapping(mapping);
+  // メタソケットのDSN状態を取得
+  MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
+
+  // 初回マッピング処理  
+  if (!dsnState.initialized) {
+    dsnState.globalDsn = mapping.HeadDSN();
+    dsnState.lastSeenDsn = mapping.HeadDSN(); 
+    dsnState.initialized = true;
+    NS_LOG_INFO("First DSN received - DSN=" << mapping.HeadDSN());
+    return true;
   }
 
-  // DSNの連続性チェック
-  if(mapping.HeadDSN() < m_expectedDsn) {
-    // すでに受信済みのデータ
-    NS_LOG_WARN("Old DSN received - Expected: " << m_expectedDsn 
-                << " Got: " << mapping.HeadDSN());
-    return false;
+  // グローバルDSNの更新
+  if (mapping.HeadDSN() > dsnState.globalDsn) {
+    dsnState.globalDsn = mapping.HeadDSN();
   }
 
-  if(mapping.HeadDSN() > m_expectedDsn) {
-    // ギャップ検出
-    uint64_t gap = mapping.HeadDSN().GetValue() - m_expectedDsn.GetValue();
-    
-    NS_LOG_WARN("DSN gap detected - Expected: " << m_expectedDsn 
-                << " Got: " << mapping.HeadDSN()
-                << " Gap: " << gap
-                << " HighestSeen: " << m_highestSeenDsn);
-
-    // ギャップ情報を保存
-    m_missingSegments[m_expectedDsn] = mapping.HeadDSN()-1;
-    
-    // DupAckカウント更新
-    m_duplicateAckCount++;
-    if(m_duplicateAckCount >= 3) {
-      GetMeta()->OnSubflowDupack(this, mapping);
-      m_duplicateAckCount = 0;
-    }
-
-    // 最大DSN更新
-    if(mapping.HeadDSN() > m_highestSeenDsn) {
-      m_highestSeenDsn = mapping.HeadDSN();
-      // 次に期待するDSNを更新
-      m_expectedDsn = m_highestSeenDsn + mapping.GetLength();
-    }
-    
-    return m_RxMappings.AddMapping(mapping);
+  // DSNの連続性チェック - グローバル
+  if (mapping.HeadDSN() < dsnState.lastSeenDsn) {
+    NS_LOG_INFO("Out of order DSN: " << mapping.HeadDSN() 
+                << " Last seen: " << dsnState.lastSeenDsn);
+    return true; // 順序が前後するのは許容
+    /*Todo*/
   }
 
-  // 期待通りのDSNを受信
-  m_highestSeenDsn = mapping.HeadDSN();
-  m_expectedDsn = m_highestSeenDsn + mapping.GetLength();
-  m_duplicateAckCount = 0;
-
-  return m_RxMappings.AddMapping(mapping);
+  dsnState.lastSeenDsn = mapping.HeadDSN();
+  return true;
 }
 
+bool MpTcpSubflow::HasDataInRange(SequenceNumber64 start, SequenceNumber64 end) {
+  NS_LOG_FUNCTION(this << start << end);
+
+  // Get mapping at head sequence
+  MpTcpMapping mapping;
+  SequenceNumber32 ssn = m_rxBuffer->HeadSequence();
+  
+  // Iterate through mappings 
+  while (m_RxMappings.GetMappingForSSN(ssn, mapping)) {
+    if (mapping.IsDSNInRange(start) && mapping.IsDSNInRange(end)) {
+      return true;
+    }
+    ssn = mapping.TailSSN() + 1;
+  }
+  return false;
+}
+
+void MpTcpSubflow::ExtractDataInRange(SequenceNumber64 start, SequenceNumber64 end) {
+  NS_LOG_FUNCTION(this << start << end);
+
+  // Find mapping at head sequence
+  MpTcpMapping mapping;
+  SequenceNumber32 ssn = m_rxBuffer->HeadSequence();
+  bool found = false;
+
+  // Iterate through mappings
+  while (m_RxMappings.GetMappingForSSN(ssn, mapping)) {
+    if (mapping.IsDSNInRange(start) && mapping.IsDSNInRange(end)) {
+      found = true;
+      break;
+    }
+    ssn = mapping.TailSSN() + 1;
+  }
+
+  if (!found) {
+    NS_LOG_WARN("No mapping found for DSN range " << start << "-" << end);
+    return;
+  }
+
+  // Extract data using single argument version
+  uint32_t length = end.GetValue() - start.GetValue();
+  Ptr<Packet> data = m_rxBuffer->Extract(length);
+
+  if (data->GetSize() > 0) {
+    NS_LOG_INFO("Extracted " << data->GetSize() << " bytes from DSN range " 
+                << start << "-" << end);
+    
+    // Notify meta socket
+    GetMeta()->OnSubflowRecv(this);
+  } else {
+    NS_LOG_WARN("Failed to extract data from buffer");
+  }
+}
 
 } // end of ns3

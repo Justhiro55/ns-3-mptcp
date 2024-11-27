@@ -1365,6 +1365,46 @@ MpTcpSocketBase::CloseAllSubflows()
   }
 }
 
+void MpTcpSocketBase::NotifyDsnGap(SequenceNumber64 expected, SequenceNumber64 received) {
+  NS_LOG_WARN("DSN gap detected in subflow " <<
+              "Expected=" << expected << " Received=" << received);
+
+  // 他のサブフローでギャップを埋められるか確認
+  for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    if (sf->HasDataInRange(expected, received)) {
+      NS_LOG_INFO("Found missing data in subflow " << i);
+      // そのサブフローからデータを取得
+      sf->ExtractDataInRange(expected, received);
+      return;
+    }
+  }
+
+  // 見つからない場合は再送を要求
+  DoRetransmit();
+}
+
+void 
+MpTcpSocketBase::CheckSubflowsForMissingData(SequenceNumber64 expectedDsn, SequenceNumber64 receivedDsn)
+{
+  NS_LOG_FUNCTION(this << expectedDsn << receivedDsn);
+
+  // 他のサブフローでギャップを埋められるか確認
+  for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    if (sf->HasDataInRange(expectedDsn, receivedDsn)) {
+      NS_LOG_INFO("Found missing data in subflow " << i);
+      // そのサブフローからデータを取得して処理
+      sf->ExtractDataInRange(expectedDsn, receivedDsn);
+      return;
+    }
+  }
+
+  // 見つからない場合は再送を要求
+  NS_LOG_WARN("Missing data not found in any subflow, requesting retransmission");
+  DoRetransmit();
+}
+
 void
 MpTcpSocketBase::ReceivedAck(
   SequenceNumber32 dack,

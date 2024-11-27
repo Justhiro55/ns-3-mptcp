@@ -255,6 +255,8 @@ public:
   virtual bool IsInfiniteMappingEnabled() const;
 
   virtual void SendEmptyPacket (uint8_t flags); // Send a empty packet that carries a flag, e.g. ACK
+  virtual bool HasDataInRange(SequenceNumber64 start, SequenceNumber64 end);
+  virtual void ExtractDataInRange(SequenceNumber64 start, SequenceNumber64 end);
 
 protected:
 
@@ -310,29 +312,17 @@ protected:
   MpTcpMappingContainer m_RxMappings;  //!< List of mappings to receive
 
 private:
-  // DSS関連のメンバ変数
-  uint8_t m_dssFlags;                  //!< used to know if AddMpTcpOptions should send a flag 
-  MpTcpMapping m_dssMapping;           //!< Pending ds configuration to be sent in next packet
+  // DSS関連
+  uint8_t m_dssFlags;  
+  MpTcpMapping m_dssMapping; 
 
-  // DSN追跡用のメンバ変数
-  SequenceNumber64 m_expectedDsn;   // 次に期待するDSN
-  bool m_gotFirstDsn;              // 最初のDSNを受信したかのフラグ
-  uint64_t m_expectedDsnOffset;     // 最初のDSNからのオフセット
-  SequenceNumber64 m_highestSeenDsn;  // 受信した最大のDSN
-
-  // 順序管理用のメンバ変数  
-  std::map<uint64_t, bool> m_inOrderDsn;   // 順序通りに受信したDSN
-  std::map<uint64_t, uint32_t> m_outOfOrderDsn;  // 順序が狂ったDSN->カウント
-  std::map<SequenceNumber64, SequenceNumber64> m_missingSegments;  // 欠落区間
-
-  // その他のメンバ変数  
-  bool m_masterSocket;  //!< True if this is the first subflow established (with MP_CAPABLE)
-  bool m_backupSubflow; //!< Priority
-  uint32_t m_localNonce;  //!< Store local host token, generated during the 3-way handshake
-  uint32_t m_duplicateAckCount;  //!< Count of duplicate ACKs
-  int m_prefixCounter;  //!< Temporary variable to help with prefix generation
-
-  Ptr<MpTcpSocketBase> m_metaSocket;  // メタソケットへの参照
+  // その他のメンバ変数は維持
+  bool m_masterSocket;
+  bool m_backupSubflow;
+  uint32_t m_localNonce;
+  uint32_t m_duplicateAckCount;
+  int m_prefixCounter;
+  Ptr<MpTcpSocketBase> m_metaSocket;
 };
 
 }
