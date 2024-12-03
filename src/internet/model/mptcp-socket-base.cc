@@ -1428,6 +1428,13 @@ MpTcpSocketBase::ReceivedAck(
         // Fast Retransmit
         DoRetransmit();
         m_dupAckCount = 0;
+
+        // RTOタイマーをリスタート
+        Time rto = sf->m_rtt->GetEstimate() * 2;
+        if (!m_retxEvent.IsExpired()) {
+          m_retxEvent.Cancel();
+        }
+        m_retxEvent = Simulator::Schedule(rto, &MpTcpSocketBase::ReTxTimeout, this);
       }
     }
     return;
@@ -1436,7 +1443,7 @@ MpTcpSocketBase::ReceivedAck(
   // Case 3: New ACK
   NS_LOG_LOGIC("New DataAck [" << dack << "]");
   
-  // バッファからデータを破棄
+  // バッファから確認済みデータを削除
   m_txBuffer->DiscardUpTo(dack);
   
   // 再送タイマーをリセット
@@ -1446,13 +1453,22 @@ MpTcpSocketBase::ReceivedAck(
   // 重複ACKカウントをリセット
   m_dupAckCount = 0;
 
-  // ウィンドウサイズを更新
+  // ウィンドウ更新
   if (dack > m_tcb->m_nextTxSequence) {
     m_tcb->m_nextTxSequence = dack;
   }
 
-  // 新しいデータを送信可能な場合は送信
-  SendPendingData(false);
+  // 送信可能データがあれば送信
+  if (m_txBuffer->Size() > 0) {
+    SendPendingData(false);
+  }
+
+  // ウィンドウサイズ計算の更新
+  uint32_t totalCwnd = ComputeTotalCWND();
+  if (totalCwnd != m_tcb->m_cWnd) {
+    NS_LOG_INFO("Updating cwnd from " << m_tcb->m_cWnd << " to " << totalCwnd);
+    m_tcb->m_cWnd = totalCwnd;
+  }
 }
 
 /* Move TCP to Time_Wait state and schedule a transition to Closed state */

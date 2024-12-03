@@ -867,6 +867,19 @@ MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
     return;
   }
 
+  // DSNの順序チェック
+  MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
+  if (mapping.HeadDSN() != dsnState.expectedDsn) {
+    NS_LOG_INFO("Out of order DSN detected - Expected=" << dsnState.expectedDsn 
+                << " Received=" << mapping.HeadDSN());
+
+    // Out-of-orderデータをメタソケットのキューに追加
+    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
+    AppendDSSAck();
+    SendEmptyPacket(TcpHeader::ACK);
+    return;
+  }
+
   // バッファに追加
   SequenceNumber32 expectedSSN = m_rxBuffer->NextRxSequence();
   if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
@@ -878,6 +891,10 @@ MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
     return;
   }
 
+  // DSN状態の更新
+  dsnState.expectedDsn = mapping.HeadDSN() + mapping.GetLength();
+  dsnState.lastSeenDsn = mapping.HeadDSN();
+
   NS_LOG_INFO("Buffer state after add - Size=" << m_rxBuffer->Size() 
               << " Available=" << m_rxBuffer->Available()
               << " NextRxSeq=" << m_rxBuffer->NextRxSequence());
@@ -885,7 +902,12 @@ MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
   // Out-of-orderパケットの処理
   if (m_rxBuffer->Size() > m_rxBuffer->Available() || 
       m_rxBuffer->NextRxSequence() > expectedSSN + p->GetSize()) {
-    NS_LOG_INFO("Out of order data detected");
+    // OoOキューにデータを追加
+    NS_LOG_INFO("Adding out-of-order data to queue");
+    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
+
+    // ギャップを他のサブフローでチェック
+    GetMeta()->CheckSubflowsForMissingData(dsnState.expectedDsn, mapping.HeadDSN());
     sendAck = true;
   }
   
@@ -907,8 +929,10 @@ MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
     NS_LOG_INFO("Sending ACK");
     SendEmptyPacket(TcpHeader::ACK);
   }
-}
 
+  // OoOキューから処理可能なデータがないかチェック
+  GetMeta()->TryProcessOfoQueue();
+}
 
 uint32_t
 MpTcpSubflow::UnAckDataCount() const
