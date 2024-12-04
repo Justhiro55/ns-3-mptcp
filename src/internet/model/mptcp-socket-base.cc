@@ -125,7 +125,8 @@ MpTcpSocketBase::MpTcpSocketBase(const TcpSocketBase& sock)
     m_peerKey(0),
     m_doChecksum(false),
     m_receivedDSS(false),
-    m_multipleSubflows(false)
+    m_multipleSubflows(false),
+    m_lastProcessedDack(0)
 {
   NS_LOG_FUNCTION(this);
   NS_LOG_LOGIC("Copying from TcpSocketBase");
@@ -139,6 +140,7 @@ MpTcpSocketBase::MpTcpSocketBase(const MpTcpSocketBase& sock)
     m_doChecksum(sock.m_doChecksum),
     m_receivedDSS(sock.m_receivedDSS),
     m_multipleSubflows(sock.m_multipleSubflows),
+    m_lastProcessedDack(sock.m_lastProcessedDack),
     m_subflowConnectionSucceeded(sock.m_subflowConnectionSucceeded),
     m_subflowConnectionFailure(sock.m_subflowConnectionFailure),
     m_joinRequest(sock.m_joinRequest),
@@ -159,6 +161,7 @@ MpTcpSocketBase::MpTcpSocketBase()
     m_doChecksum(false),
     m_receivedDSS(false),
     m_multipleSubflows(false),
+    m_lastProcessedDack(0),
     fLowStartTime(0),
     m_subflowTypeId(MpTcpSubflow::GetTypeId ()),
     m_schedulerTypeId(MpTcpSchedulerRoundRobin::GetTypeId())
@@ -1411,9 +1414,26 @@ MpTcpSocketBase::ReceivedAck(
   Ptr<MpTcpSubflow> sf, 
   bool count_dupacks)
 {
-  NS_LOG_FUNCTION("Received DACK " << dack << "from subflow=" << sf << 
-                  "(Enable dupacks:" << count_dupacks << " )");
+    NS_LOG_FUNCTION("Received DACK " << dack << " from subflow=" << sf);
 
+  if (!sf) {
+    NS_LOG_ERROR("Null subflow in ReceivedAck");
+    return;
+  }
+
+  if (!m_txBuffer || !sf->m_txBuffer) {
+    NS_LOG_ERROR("Invalid buffer state in ReceivedAck");
+    return;
+  }
+
+  // 同一DACKの重複チェック
+  if (dack <= m_lastProcessedDack) {
+    NS_LOG_LOGIC("Duplicate DACK " << dack << " ignored");
+    return;
+  }
+  m_lastProcessedDack = dack;
+
+  // 以降は既存の処理
   if (dack < m_txBuffer->HeadSequence()) {
     // Case 1: Old ACK, ignored
     NS_LOG_LOGIC("Old ack Ignored " << dack);
@@ -1428,13 +1448,6 @@ MpTcpSocketBase::ReceivedAck(
         // Fast Retransmit
         DoRetransmit();
         m_dupAckCount = 0;
-
-        // RTOタイマーをリスタート
-        Time rto = sf->m_rtt->GetEstimate() * 2;
-        if (!m_retxEvent.IsExpired()) {
-          m_retxEvent.Cancel();
-        }
-        m_retxEvent = Simulator::Schedule(rto, &MpTcpSocketBase::ReTxTimeout, this);
       }
     }
     return;
@@ -1442,10 +1455,8 @@ MpTcpSocketBase::ReceivedAck(
 
   // Case 3: New ACK
   NS_LOG_LOGIC("New DataAck [" << dack << "]");
-  
   // バッファから確認済みデータを削除
   m_txBuffer->DiscardUpTo(dack);
-  
   // 再送タイマーをリセット
   bool resetRTO = true;
   NewAck(dack, resetRTO);
@@ -1461,13 +1472,6 @@ MpTcpSocketBase::ReceivedAck(
   // 送信可能データがあれば送信
   if (m_txBuffer->Size() > 0) {
     SendPendingData(false);
-  }
-
-  // ウィンドウサイズ計算の更新
-  uint32_t totalCwnd = ComputeTotalCWND();
-  if (totalCwnd != m_tcb->m_cWnd) {
-    NS_LOG_INFO("Updating cwnd from " << m_tcb->m_cWnd << " to " << totalCwnd);
-    m_tcb->m_cWnd = totalCwnd;
   }
 }
 

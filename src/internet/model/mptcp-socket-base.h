@@ -554,6 +554,7 @@ private:
   bool     m_receivedDSS;  //!< True if we received at least one DSS
   bool     m_outOfOrderDss;  // DSS out-of-orderを検出したフラグ  
   bool     m_multipleSubflows; //!< true if required number of subflows have been created [KN]
+  SequenceNumber32 m_lastProcessedDack;
   double   fLowStartTime;
 
   /* \brief Utility function used when a subflow changes state
@@ -594,48 +595,51 @@ struct OfoQueueItem {
 std::set<OfoQueueItem> m_ofoQueue;
 
 void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTcpSubflow> subflow) {
+  if (!packet || !subflow) {
+    std::cout << "Invalid packet or subflow" << std::endl;
+    return;
+  }
+
   SequenceNumber64 currentDsn = mapping.HeadDSN();
 
   // expectedDsnより前のデータは破棄またはバッファに追加すべき
   if (currentDsn < m_dsnState.expectedDsn) {
-    std::cout << "Received old DSN=" << currentDsn << " Expected=" << m_dsnState.expectedDsn << std::endl;
+    std::cout << "Dropping old data DSN=" << currentDsn.GetValue() << std::endl;
     // 重複パケットは破棄
     return;
   }
 
   std::cout << std::endl;
   std::cout << "=============== New Out-of-order Packet ================" << std::endl;
-  std::cout << "Queueing packet:"
             << " DSN=" << mapping.HeadDSN().GetValue()
             << " Length=" << mapping.GetLength()
             << " From subflow=" << subflow << std::endl;
 
   // クリーンアップ - 期待値より前のパケットを削除
-  while (!m_ofoQueue.empty()) {
-    const auto& front = m_ofoQueue.begin();
-    if (front->mapping.HeadDSN() < m_dsnState.expectedDsn) {
-      m_ofoQueue.erase(front);
+  auto it = m_ofoQueue.begin();
+  while (it != m_ofoQueue.end()) {
+    if (it->mapping.HeadDSN() < m_dsnState.expectedDsn) {
+      it = m_ofoQueue.erase(it); 
     } else {
-      break;
+      ++it;
     }
   }
 
-  // デバッグ用にキューのサイズを出力
-  std::cout << "Queue size before insertion: " << m_ofoQueue.size() << std::endl;
-
-  // データをキューに追加して結果をチェック
-  if (!m_ofoQueue.insert(OfoQueueItem(packet->Copy(), mapping, subflow)).second) {
-    std::cout << "Failed to insert packet into out-of-order queue" << std::endl;
+  // キューに追加
+  auto result = m_ofoQueue.insert(OfoQueueItem(packet->Copy(), mapping, subflow));
+  if (!result.second) {
+    std::cout << "Failed to insert packet into OFO queue" << std::endl;
     return;
   }
 
   // キューの状態を出力
-  std::cout << "Current queue contents (" << m_ofoQueue.size() << " packets):" << std::endl;
+  std::cout << "Queue state (" << m_ofoQueue.size() << " packets):" << std::endl;
+
+  // 各パケットの情報を出力
   for (const auto& item : m_ofoQueue) {
     std::cout << "- DSN=" << item.mapping.HeadDSN().GetValue()
               << " Length=" << item.mapping.GetLength() 
-              << " SSN=" << item.mapping.HeadSSN().GetValue()
-              << " From subflow=" << item.subflow << std::endl;
+              << " From=" << item.subflow << std::endl;
   }
 
   std::cout << "Next expected DSN=" << m_dsnState.expectedDsn.GetValue() << std::endl;
@@ -646,29 +650,47 @@ void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTc
     std::cout << "Attempting to process queued packets..." << std::endl;
     TryProcessOfoQueue();
   }
-
-  std::cout.flush();
 }
 
 void TryProcessOfoQueue() {
-  while (!m_ofoQueue.empty()) {
-    const auto& front = m_ofoQueue.begin();
+  SequenceNumber64 maxContinuousDsn = m_dsnState.expectedDsn;
+  bool dataProcessed = false;
 
-    if (front->mapping.HeadDSN() == m_dsnState.expectedDsn) {
-      if (front->subflow->m_rxBuffer->Add(front->packet, front->mapping.HeadSSN())) {
-        m_dsnState.expectedDsn = front->mapping.HeadDSN() + front->mapping.GetLength();
-
-        if (!m_shutdownRecv) {
-          NotifyDataRecv();
-        }
-
-        m_ofoQueue.erase(front);
-      } else {
-        break;
+  // 連続したDSNを探索
+  for (const auto& item : m_ofoQueue) {
+    if (item.mapping.HeadDSN() == maxContinuousDsn) {
+      // 連続したDSNを発見
+      if (item.subflow->m_rxBuffer->Add(item.packet, item.mapping.HeadSSN())) {
+        maxContinuousDsn = item.mapping.HeadDSN() + item.mapping.GetLength();
+        dataProcessed = true;
       }
     } else {
       break;
     }
+  }
+
+  if (dataProcessed) {
+    // 状態を更新
+    m_dsnState.expectedDsn = maxContinuousDsn;
+    m_dsnState.lastSeenDsn = maxContinuousDsn;
+
+    // 処理済みパケットを削除
+  while (!m_ofoQueue.empty()) {
+    const auto& front = m_ofoQueue.begin();
+      if (front->mapping.HeadDSN() < maxContinuousDsn) {
+        m_ofoQueue.erase(front);
+      } else {
+        break;
+      }
+    }
+
+    // 最新のDSNに対するACKを送信
+    if (!m_ofoQueue.empty()) {
+      const auto& front = m_ofoQueue.begin();
+      front->subflow->SendEmptyPacket(TcpHeader::ACK);
+    }
+
+    NotifyDataRecv();
   }
 }
 };

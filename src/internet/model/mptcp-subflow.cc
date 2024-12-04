@@ -687,7 +687,18 @@ MpTcpSubflow::ProcessSynRcvd(Ptr<Packet> packet, const TcpHeader& tcpHeader, con
 uint32_t
 MpTcpSubflow::SendPendingData(bool withAck)
 {
-  NS_LOG_FUNCTION(this);
+  NS_LOG_FUNCTION(this << withAck);
+  
+  if (!m_txBuffer || !m_metaSocket) {
+    NS_LOG_ERROR("Invalid socket state in SendPendingData");
+    return 0;
+  }
+
+  if (m_state != ESTABLISHED && m_state != CLOSE_WAIT) {
+    NS_LOG_WARN("SendPendingData called in invalid state " << TcpStateName[m_state]);
+    return 0;
+  }
+
   return TcpSocketBase::SendPendingData(withAck);
 }
 
@@ -945,7 +956,21 @@ uint32_t
 MpTcpSubflow::BytesInFlight() const
 {
   NS_LOG_FUNCTION (this);
-  return TcpSocketBase::BytesInFlight();
+
+  /*
+  Todo
+  - バッファから直接BytesInFlightを計算
+  */
+  return 0;
+  if (!m_txBuffer || m_state == CLOSED || m_state == LISTEN || m_state == SYN_SENT) {
+    NS_LOG_WARN("Invalid state for BytesInFlight calculation");
+    return 0;
+  }
+
+  // バッファから直接BytesInFlightを計算
+  uint32_t bytesInFlight = m_txBuffer->BytesInFlight();
+  std::cout << "Calculated BytesInFlight: " << bytesInFlight << std::endl;
+  return bytesInFlight;
 }
 
 uint32_t
