@@ -859,90 +859,56 @@ MpTcpSubflow::AppendDSSFin()
   m_dssFlags |= TcpOptionMpTcpDSS::DataFin;
 }
 
-void 
-MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
-{
-  NS_LOG_FUNCTION(this << tcpHeader);
-  
-  NS_LOG_INFO("Received data - SSN=" << tcpHeader.GetSequenceNumber() 
-              << " Size=" << p->GetSize()
-              << " NextRxSeq=" << m_rxBuffer->NextRxSequence());
+void MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader) {
+    NS_LOG_FUNCTION(this << tcpHeader);
 
-  MpTcpMapping mapping;
-  bool sendAck = false;
+    // マッピング検索  
+    MpTcpMapping mapping;
+    bool result = m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping);
+    if (!result) {
+        NS_LOG_ERROR("No mapping found for SSN=" << tcpHeader.GetSequenceNumber());
+        return;
+    }
 
-  // マッピング検索
-  if(!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping)) {
-    NS_LOG_ERROR("No mapping found for SSN=" << tcpHeader.GetSequenceNumber());
-    m_RxMappings.Dump();
-    return;
-  }
+    // メタソケットのDSN状態を取得
+    MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
 
-  // DSNの順序チェック
-  MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
-  if (mapping.HeadDSN() != dsnState.expectedDsn) {
-    NS_LOG_INFO("Out of order DSN detected - Expected=" << dsnState.expectedDsn 
-                << " Received=" << mapping.HeadDSN());
+    // 初回データ受信時の初期化
+    if (!dsnState.initialized) {
+        dsnState.Initialize(mapping.HeadDSN());
+        if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+            NS_LOG_WARN("Failed to add to rx buffer");
+        }
+        return;
+    }
 
-    // Out-of-orderデータをメタソケットのキューに追加
-    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
-    AppendDSSAck();
-    SendEmptyPacket(TcpHeader::ACK);
-    return;
-  }
+    // DSNギャップの検出
+    uint32_t gapSize = 0;
+    if (dsnState.HasGap(mapping.HeadDSN(), gapSize)) {
+        NS_LOG_WARN("DSN gap detected: expected=" << dsnState.expectedDsn 
+                    << " received=" << mapping.HeadDSN()
+                    << " gap=" << gapSize);
+        
+        // OoOキューに追加して処理
+        GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
+        SendEmptyPacket(TcpHeader::ACK);
+        return;
+    }
 
-  // バッファに追加
-  SequenceNumber32 expectedSSN = m_rxBuffer->NextRxSequence();
-  if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
-    NS_LOG_WARN("Failed to add to rx buffer - Size=" << p->GetSize() 
-                << " Available=" << m_rxBuffer->Available());
-    
-    AppendDSSAck();
-    SendEmptyPacket(TcpHeader::ACK);
-    return;
-  }
+    // 順序通りのデータを受信
+    if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+        NS_LOG_WARN("Failed to add to rx buffer");
+        return;
+    }
 
-  // DSN状態の更新
-  dsnState.expectedDsn = mapping.HeadDSN() + mapping.GetLength();
-  dsnState.lastSeenDsn = mapping.HeadDSN();
+    // DSN状態の更新
+    dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
 
-  NS_LOG_INFO("Buffer state after add - Size=" << m_rxBuffer->Size() 
-              << " Available=" << m_rxBuffer->Available()
-              << " NextRxSeq=" << m_rxBuffer->NextRxSequence());
-
-  // Out-of-orderパケットの処理
-  if (m_rxBuffer->Size() > m_rxBuffer->Available() || 
-      m_rxBuffer->NextRxSequence() > expectedSSN + p->GetSize()) {
-    // OoOキューにデータを追加
-    NS_LOG_INFO("Adding out-of-order data to queue");
-    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
-
-    // ギャップを他のサブフローでチェック
-    GetMeta()->CheckSubflowsForMissingData(dsnState.expectedDsn, mapping.HeadDSN());
-    sendAck = true;
-  }
-  
-  // アプリケーションへの通知
-  if (expectedSSN < m_rxBuffer->NextRxSequence()) {
-    NS_LOG_INFO("Notifying application of new data");
     if (!m_shutdownRecv) {
-      GetMeta()->OnSubflowRecv(this);
-      sendAck = true;
+        GetMeta()->OnSubflowRecv(this);
     }
 
-    if (m_rxBuffer->Finished() && (tcpHeader.GetFlags() & TcpHeader::FIN) == 0) {
-      NS_LOG_INFO("All data received - initiating peer close");
-      DoPeerClose();
-    }
-  }
-
-  if (sendAck) {
-    NS_LOG_INFO("Sending ACK");
     SendEmptyPacket(TcpHeader::ACK);
-  }
-
-  // OoOキューから処理可能なデータがないかチェック
-  GetMeta()->TryProcessOfoQueue();
 }
 
 uint32_t
@@ -1085,26 +1051,33 @@ bool MpTcpSubflow::CheckDssIntegrity(const MpTcpMapping& mapping) {
   // メタソケットのDSN状態を取得
   MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
 
-  // 初回マッピング処理  
+  // 初回マッピング処理
   if (!dsnState.initialized) {
-    dsnState.globalDsn = mapping.HeadDSN();
-    dsnState.lastSeenDsn = mapping.HeadDSN(); 
     dsnState.initialized = true;
-    NS_LOG_INFO("First DSN received - DSN=" << mapping.HeadDSN());
+    dsnState.expectedDsn = mapping.HeadDSN();
+    dsnState.lastSeenDsn = mapping.HeadDSN();
+    dsnState.globalDsn = mapping.HeadDSN();
     return true;
   }
 
-  // グローバルDSNの更新
+  // グローバルDSN 更新
   if (mapping.HeadDSN() > dsnState.globalDsn) {
-    dsnState.globalDsn = mapping.HeadDSN();
+    dsnState.globalDsn = mapping.HeadDSN(); 
   }
 
-  // DSNの連続性チェック - グローバル
+  // マッピングの長さが正当か
+  if (mapping.GetLength() == 0 || mapping.GetLength() > 16384) {
+    NS_LOG_WARN("Invalid mapping length: " << mapping.GetLength());
+    return false;
+  }
+
+  // DSNの重複チェック
   if (mapping.HeadDSN() < dsnState.lastSeenDsn) {
-    NS_LOG_INFO("Out of order DSN: " << mapping.HeadDSN() 
-                << " Last seen: " << dsnState.lastSeenDsn);
-    return true; // 順序が前後するのは許容
-    /*Todo*/
+    uint32_t gapSize = dsnState.lastSeenDsn.GetValue() - mapping.HeadDSN().GetValue();
+    NS_LOG_INFO("Duplicate or reordered DSN detected - Last seen=" 
+                << dsnState.lastSeenDsn
+                << " Current=" << mapping.HeadDSN()
+                << " Gap=" << gapSize);
   }
 
   dsnState.lastSeenDsn = mapping.HeadDSN();

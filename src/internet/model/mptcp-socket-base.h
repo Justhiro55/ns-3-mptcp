@@ -146,22 +146,37 @@ public:
       return dsn == expectedDsn;
     }
 
-    // ギャップチェック
-    bool HasGap(SequenceNumber64 dsn, uint32_t& gapSize) const {
-      if (dsn > expectedDsn) {
-        gapSize = dsn.GetValue() - expectedDsn.GetValue();
-        return true;
+    void Initialize(SequenceNumber64 dsn) {
+      if (!initialized) {
+        initialized = true;
+        expectedDsn = dsn;
+        lastSeenDsn = dsn;
       }
-      return false;
     }
+
+    bool HasGap(SequenceNumber64 dsn, uint32_t& gapSize) const {
+        if (!initialized) {
+            return false;
+        }
+
+        // 期待DSNとの差分を計算
+        if (dsn > expectedDsn) {
+            gapSize = dsn.GetValue() - expectedDsn.GetValue();
+            return true;
+        }
+
+        // 期待DSNと一致または以前のデータは正常とみなす
+        return false;
+    }
+
 
     // DSN更新
     void UpdateDsn(SequenceNumber64 dsn, uint32_t length) {
-      if (dsn > globalDsn) {
-        globalDsn = dsn;
-      }
       lastSeenDsn = dsn;
       expectedDsn = dsn + length;
+      if (dsn > globalDsn) {
+          globalDsn = dsn;
+      }
     }
   };
   DsnState& GetDsnState() { return m_dsnState; }
@@ -595,6 +610,7 @@ struct OfoQueueItem {
 std::set<OfoQueueItem> m_ofoQueue;
 
 void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTcpSubflow> subflow) {
+  std::cout << "ProcessOutOfOrder called" << std::endl;
   if (!packet || !subflow) {
     std::cout << "Invalid packet or subflow" << std::endl;
     return;
@@ -610,10 +626,11 @@ void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTc
   }
 
   std::cout << std::endl;
-  std::cout << "=============== New Out-of-order Packet ================" << std::endl;
-            << " DSN=" << mapping.HeadDSN().GetValue()
-            << " Length=" << mapping.GetLength()
-            << " From subflow=" << subflow << std::endl;
+  std::cout << "=============== New Out-of-order Packet ================";
+  std::cout << std::endl;
+  std::cout << " DSN=" << mapping.HeadDSN().GetValue() << std::endl;
+  std::cout << " Length=" << mapping.GetLength() << std::endl;
+  std::cout << " From subflow=" << subflow << std::endl;
 
   // クリーンアップ - 期待値より前のパケットを削除
   auto it = m_ofoQueue.begin();
@@ -653,6 +670,7 @@ void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTc
 }
 
 void TryProcessOfoQueue() {
+  std::cout << "TryProcessOfoQueue called" << std::endl;
   SequenceNumber64 maxContinuousDsn = m_dsnState.expectedDsn;
   bool dataProcessed = false;
 
