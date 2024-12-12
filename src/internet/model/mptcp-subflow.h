@@ -185,7 +185,7 @@ public:
   virtual int ProcessOptionMpTcpDSSEstablished (const Ptr<const TcpOptionMpTcpDSS> option);
   virtual int ProcessOptionMpTcpJoin (const Ptr<const TcpOptionMpTcpMain> option);
   virtual int ProcessOptionMpTcpCapable (const Ptr<const TcpOptionMpTcpMain> option);
-
+  virtual bool CheckDssIntegrity(const MpTcpMapping& mapping);
   /*
    * \brief Process TcpOptionTcpAddAddress 
    * \briefto add advertised address and create new subflows
@@ -240,7 +240,6 @@ protected:
 
   virtual void ProcessClosing(Ptr<Packet> packet, const TcpHeader& tcpHeader);
   virtual int ProcessOptionMpTcp (const Ptr<const TcpOption> option);
-  Ptr<MpTcpSocketBase> m_metaSocket;    //!< Meta
   virtual void SendPacket(TcpHeader header, Ptr<Packet> p);
 
 public:
@@ -256,6 +255,8 @@ public:
   virtual bool IsInfiniteMappingEnabled() const;
 
   virtual void SendEmptyPacket (uint8_t flags); // Send a empty packet that carries a flag, e.g. ACK
+  virtual bool HasDataInRange(SequenceNumber64 start, SequenceNumber64 end);
+  virtual void ExtractDataInRange(SequenceNumber64 start, SequenceNumber64 end);
 
 protected:
 
@@ -311,14 +312,17 @@ protected:
   MpTcpMappingContainer m_RxMappings;  //!< List of mappings to receive
 
 private:
-  // Delayed values to
-  uint8_t m_dssFlags;           //!< used to know if AddMpTcpOptions should send a flag
-  bool m_masterSocket;  //!< True if this is the first subflow established (with MP_CAPABLE)
-  MpTcpMapping m_dssMapping;    //!< Pending ds configuration to be sent in next packet
-  bool m_backupSubflow; //!< Priority
-  uint32_t m_localNonce;  //!< Store local host token, generated during the 3-way handshake
-  int m_prefixCounter;  //!< Temporary variable to help with prefix generation . To remove later
+  // DSS関連
+  uint8_t m_dssFlags;  
+  MpTcpMapping m_dssMapping; 
 
+  // その他のメンバ変数は維持
+  bool m_masterSocket;
+  bool m_backupSubflow;
+  uint32_t m_localNonce;
+  uint32_t m_duplicateAckCount;
+  int m_prefixCounter;
+  Ptr<MpTcpSocketBase> m_metaSocket;
 };
 
 }

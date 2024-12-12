@@ -3388,12 +3388,13 @@ TcpSocketBase::UnAckDataCount () const
 uint32_t
 TcpSocketBase::BytesInFlight () const
 {
+  std::cout << "TCP BytesInFlight" << std::endl;
   uint32_t bytesInFlight = m_txBuffer->BytesInFlight ();
   // Ugly, but we are not modifying the state; m_bytesInFlight is used
   // only for tracing purpose.
   m_tcb->m_bytesInFlight = bytesInFlight;
 
-  NS_LOG_DEBUG ("Returning calculated bytesInFlight: " << bytesInFlight);
+  std::cout << "Returning calculated bytesInFlight: " << bytesInFlight << std::endl;
   return bytesInFlight;
 }
 

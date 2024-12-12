@@ -169,10 +169,14 @@ MpTcpSubflow::MpTcpSubflow(const MpTcpSubflow& sock)
 
 MpTcpSubflow::MpTcpSubflow()
   : TcpSocketBase(),
-    m_metaSocket(0),
+    m_dssFlags(0),
+    m_dssMapping(),
     m_masterSocket(false),
     m_backupSubflow(false),
-    m_localNonce(0)
+    m_localNonce(0),
+    m_duplicateAckCount(0),
+    m_prefixCounter(0),
+    m_metaSocket(nullptr)
 {
   NS_LOG_FUNCTION(this);
 }
@@ -683,7 +687,18 @@ MpTcpSubflow::ProcessSynRcvd(Ptr<Packet> packet, const TcpHeader& tcpHeader, con
 uint32_t
 MpTcpSubflow::SendPendingData(bool withAck)
 {
-  NS_LOG_FUNCTION(this);
+  NS_LOG_FUNCTION(this << withAck);
+  
+  if (!m_txBuffer || !m_metaSocket) {
+    NS_LOG_ERROR("Invalid socket state in SendPendingData");
+    return 0;
+  }
+
+  if (m_state != ESTABLISHED && m_state != CLOSE_WAIT) {
+    NS_LOG_WARN("SendPendingData called in invalid state " << TcpStateName[m_state]);
+    return 0;
+  }
+
   return TcpSocketBase::SendPendingData(withAck);
 }
 
@@ -844,70 +859,56 @@ MpTcpSubflow::AppendDSSFin()
   m_dssFlags |= TcpOptionMpTcpDSS::DataFin;
 }
 
-void
-MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
-{
-  NS_LOG_FUNCTION (this << tcpHeader);
-  MpTcpMapping mapping;
-  bool sendAck = false;
+void MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader) {
+    NS_LOG_FUNCTION(this << tcpHeader);
 
-  // OutOfRange
-  // If cannot find an adequate mapping, then it should [check RFC]
-  if(!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping) )
-   {
-     m_RxMappings.Dump();
-     NS_FATAL_ERROR("Could not find mapping associated ");
-     return;
-   }
-  // Put into Rx buffer
-  SequenceNumber32 expectedSSN = m_rxBuffer->NextRxSequence();
-  if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber()))
-    { // Insert failed: No data or RX buffer full
-      NS_LOG_WARN("Insert failed, No data (" << p->GetSize() << ") ?");
-
-      m_rxBuffer->Dump();
-      AppendDSSAck();
-      SendEmptyPacket(TcpHeader::ACK);
-      return;
+    // マッピング検索  
+    MpTcpMapping mapping;
+    bool result = m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping);
+    if (!result) {
+        NS_LOG_ERROR("No mapping found for SSN=" << tcpHeader.GetSequenceNumber());
+        return;
     }
 
-  // Size() = Get the actual buffer occupancy
-  if (m_rxBuffer->Size() > m_rxBuffer->Available() /* Out of order packets exist in buffer */
-    || m_rxBuffer->NextRxSequence() > expectedSSN + p->GetSize() /* or we filled a gap */
-    )
-    { // A gap exists in the buffer, or we filled a gap: Always ACK
-      sendAck = true;
-    }
-  else
-    { 
-      sendAck = true;
-    }
-  // Notify app to receive if necessary
-  if (expectedSSN < m_rxBuffer->NextRxSequence())
-    { // NextRxSeq advanced, we have something to send to the app
-      if (!m_shutdownRecv)
-        {
-          GetMeta()->OnSubflowRecv( this );
-          sendAck = true;
+    // メタソケットのDSN状態を取得
+    MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
+
+    // 初回データ受信時の初期化
+    if (!dsnState.initialized) {
+        dsnState.Initialize(mapping.HeadDSN());
+        if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+            NS_LOG_WARN("Failed to add to rx buffer");
         }
-      // Handle exceptions
-      if (m_closeNotified)
-        {
-          NS_LOG_WARN ("Why TCP " << this << " got data after close notification?");
-        }
-      // If we received FIN before and now completed all "holes" in rx buffer,
-      // invoke peer close procedure
-      if (m_rxBuffer->Finished() && (tcpHeader.GetFlags() & TcpHeader::FIN) == 0)
-        {
-          DoPeerClose();
-        }
+        return;
     }
-  // For now we always sent an ack
-  // should be always true hack to allow compilation
-  if (sendAck)
-    {
-      SendEmptyPacket(TcpHeader::ACK);
+
+    // DSNギャップの検出
+    uint32_t gapSize = 0;
+    if (dsnState.HasGap(mapping.HeadDSN(), gapSize)) {
+        NS_LOG_WARN("DSN gap detected: expected=" << dsnState.expectedDsn 
+                    << " received=" << mapping.HeadDSN()
+                    << " gap=" << gapSize);
+        
+        // OoOキューに追加して処理
+        GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
+        SendEmptyPacket(TcpHeader::ACK);
+        return;
     }
+
+    // 順序通りのデータを受信
+    if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+        NS_LOG_WARN("Failed to add to rx buffer");
+        return;
+    }
+
+    // DSN状態の更新
+    dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
+
+    if (!m_shutdownRecv) {
+        GetMeta()->OnSubflowRecv(this);
+    }
+
+    SendEmptyPacket(TcpHeader::ACK);
 }
 
 uint32_t
@@ -921,7 +922,21 @@ uint32_t
 MpTcpSubflow::BytesInFlight() const
 {
   NS_LOG_FUNCTION (this);
-  return TcpSocketBase::BytesInFlight();
+
+  /*
+  Todo
+  - バッファから直接BytesInFlightを計算
+  */
+  return 0;
+  if (!m_txBuffer || m_state == CLOSED || m_state == LISTEN || m_state == SYN_SENT) {
+    NS_LOG_WARN("Invalid state for BytesInFlight calculation");
+    return 0;
+  }
+
+  // バッファから直接BytesInFlightを計算
+  uint32_t bytesInFlight = m_txBuffer->BytesInFlight();
+  std::cout << "Calculated BytesInFlight: " << bytesInFlight << std::endl;
+  return bytesInFlight;
 }
 
 uint32_t
@@ -965,45 +980,6 @@ MpTcpSubflow::ClosingOnEmpty(TcpHeader& header)
   GetMeta()->OnSubflowClosing(this);
 }
 
-int
-MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS> dss)
-{
-  NS_LOG_FUNCTION (this << dss << " from subflow ");
-
-  if(!GetMeta()->FullyEstablished() )
-  {
-    NS_LOG_LOGIC("First DSS received !");
-    GetMeta()->BecomeFullyEstablished();
-  }
-
-  //! datafin case handled at the start of the function
-  if( (dss->GetFlags() & TcpOptionMpTcpDSS::DSNMappingPresent) && !dss->DataFinMappingOnly() )
-  {
-    MpTcpMapping m;
-    //Get mapping n'est utilisé qu'une fois, copier le code ici
-    m = GetMapping(dss);
-    // Add peer mapping
-    bool ok = m_RxMappings.AddMapping( m );
-    if(!ok)
-      {
-        NS_LOG_WARN("Could not insert mapping: already received ?");
-        NS_LOG_UNCOND("Dumping Rx mappings...");
-        m_RxMappings.Dump();
-      }
-  }
-  if ( dss->GetFlags() & TcpOptionMpTcpDSS::DataFin)
-  {
-    NS_LOG_LOGIC("DFIN detected " << dss->GetDataFinDSN());
-    GetMeta()->PeerClose( SequenceNumber32(dss->GetDataFinDSN()), this);
-  }
-
-  if( dss->GetFlags() & TcpOptionMpTcpDSS::DataAckPresent)
-  {
-    GetMeta()->ReceivedAck( SequenceNumber32(dss->GetDataAck()), this, false);
-  }
-  return 0;
-}
-
 /* Upon ack receival we need to act depending on if it's new or not
    if it's new it may allow us to discard a mapping
    otherwise notify meta of duplicate
@@ -1018,6 +994,148 @@ MpTcpSubflow::ReceivedAck(Ptr<Packet> p, const TcpHeader& header)
   // By default we always append a DACK
   // We should consider more advanced schemes
   AppendDSSAck();
+}
+
+int 
+MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS> dss)
+{
+  NS_LOG_FUNCTION(this << dss << " from subflow ");
+
+  if(!GetMeta()->FullyEstablished())
+  {
+    NS_LOG_LOGIC("First DSS received!");
+    GetMeta()->BecomeFullyEstablished();
+  }
+
+  if((dss->GetFlags() & TcpOptionMpTcpDSS::DSNMappingPresent) && !dss->DataFinMappingOnly())
+  {
+    MpTcpMapping mapping = GetMapping(dss);
+    
+    // Check DSS integrity
+    if(!CheckDssIntegrity(mapping))
+    {
+      NS_LOG_WARN("DSS integrity check failed - sending duplicate ACK");
+      AppendDSSAck();
+      SendEmptyPacket(TcpHeader::ACK); 
+      return 0;
+    }
+
+    // Add mapping
+    bool ok = m_RxMappings.AddMapping(mapping);
+    if(!ok)
+    {
+      NS_LOG_WARN("Could not insert mapping: already received?");
+      m_RxMappings.Dump();
+    }
+  }
+
+  if(dss->GetFlags() & TcpOptionMpTcpDSS::DataFin)
+  {
+    NS_LOG_LOGIC("DFIN detected " << dss->GetDataFinDSN());
+    GetMeta()->PeerClose(SequenceNumber32(dss->GetDataFinDSN()), this);
+  }
+
+  if(dss->GetFlags() & TcpOptionMpTcpDSS::DataAckPresent)
+  {
+    GetMeta()->ReceivedAck(SequenceNumber32(dss->GetDataAck()), this, false);
+  }
+
+  return 0;
+}
+
+bool MpTcpSubflow::CheckDssIntegrity(const MpTcpMapping& mapping) {
+  NS_LOG_FUNCTION(this << "DSN=" << mapping.HeadDSN() 
+                      << " SSN=" << mapping.HeadSSN()
+                      << " Length=" << mapping.GetLength());
+
+  // メタソケットのDSN状態を取得
+  MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
+
+  // 初回マッピング処理
+  if (!dsnState.initialized) {
+    dsnState.initialized = true;
+    dsnState.expectedDsn = mapping.HeadDSN();
+    dsnState.lastSeenDsn = mapping.HeadDSN();
+    dsnState.globalDsn = mapping.HeadDSN();
+    return true;
+  }
+
+  // グローバルDSN 更新
+  if (mapping.HeadDSN() > dsnState.globalDsn) {
+    dsnState.globalDsn = mapping.HeadDSN(); 
+  }
+
+  // マッピングの長さが正当か
+  if (mapping.GetLength() == 0 || mapping.GetLength() > 16384) {
+    NS_LOG_WARN("Invalid mapping length: " << mapping.GetLength());
+    return false;
+  }
+
+  // DSNの重複チェック
+  if (mapping.HeadDSN() < dsnState.lastSeenDsn) {
+    uint32_t gapSize = dsnState.lastSeenDsn.GetValue() - mapping.HeadDSN().GetValue();
+    NS_LOG_INFO("Duplicate or reordered DSN detected - Last seen=" 
+                << dsnState.lastSeenDsn
+                << " Current=" << mapping.HeadDSN()
+                << " Gap=" << gapSize);
+  }
+
+  dsnState.lastSeenDsn = mapping.HeadDSN();
+  return true;
+}
+
+bool MpTcpSubflow::HasDataInRange(SequenceNumber64 start, SequenceNumber64 end) {
+  NS_LOG_FUNCTION(this << start << end);
+
+  // Get mapping at head sequence
+  MpTcpMapping mapping;
+  SequenceNumber32 ssn = m_rxBuffer->HeadSequence();
+  
+  // Iterate through mappings 
+  while (m_RxMappings.GetMappingForSSN(ssn, mapping)) {
+    if (mapping.IsDSNInRange(start) && mapping.IsDSNInRange(end)) {
+      return true;
+    }
+    ssn = mapping.TailSSN() + 1;
+  }
+  return false;
+}
+
+void MpTcpSubflow::ExtractDataInRange(SequenceNumber64 start, SequenceNumber64 end) {
+  NS_LOG_FUNCTION(this << start << end);
+
+  // Find mapping at head sequence
+  MpTcpMapping mapping;
+  SequenceNumber32 ssn = m_rxBuffer->HeadSequence();
+  bool found = false;
+
+  // Iterate through mappings
+  while (m_RxMappings.GetMappingForSSN(ssn, mapping)) {
+    if (mapping.IsDSNInRange(start) && mapping.IsDSNInRange(end)) {
+      found = true;
+      break;
+    }
+    ssn = mapping.TailSSN() + 1;
+  }
+
+  if (!found) {
+    NS_LOG_WARN("No mapping found for DSN range " << start << "-" << end);
+    return;
+  }
+
+  // Extract data using single argument version
+  uint32_t length = end.GetValue() - start.GetValue();
+  Ptr<Packet> data = m_rxBuffer->Extract(length);
+
+  if (data->GetSize() > 0) {
+    NS_LOG_INFO("Extracted " << data->GetSize() << " bytes from DSN range " 
+                << start << "-" << end);
+    
+    // Notify meta socket
+    GetMeta()->OnSubflowRecv(this);
+  } else {
+    NS_LOG_WARN("Failed to extract data from buffer");
+  }
 }
 
 } // end of ns3
