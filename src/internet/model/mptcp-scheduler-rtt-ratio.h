@@ -1,0 +1,37 @@
+#ifndef MPTCP_SCHEDULER_RTT_RATIO_H
+#define MPTCP_SCHEDULER_RTT_RATIO_H
+
+#include "ns3/mptcp-scheduler.h"
+#include "ns3/object.h"
+#include "ns3/ptr.h"
+#include <vector>
+#include <list>
+
+namespace ns3 {
+
+class MpTcpSocketBase;
+class MpTcpSubflow;
+
+class MpTcpSchedulerRTTRatio : public MpTcpScheduler {
+public:
+  static TypeId GetTypeId(void);
+
+  MpTcpSchedulerRTTRatio();
+  virtual ~MpTcpSchedulerRTTRatio();
+  void SetMeta(Ptr<MpTcpSocketBase> metaSock);
+
+  virtual bool GenerateMapping(int& activeSubflowArrayId, SequenceNumber64& dsn, uint16_t& length);
+  virtual Ptr<MpTcpSubflow> GetSubflowToUseForEmptyPacket();
+
+protected:
+  uint8_t m_lastUsedFlowId;
+  Ptr<MpTcpSocketBase> m_metaSock;
+
+  // RTTベースのスケジューリング用の変数を追加
+  uint32_t m_cycleCount;  // 現在のサイクル数
+  static const uint32_t TOTAL_CYCLES = 11; // 1:10の比率のための総サイクル数
+};
+
+} // namespace ns3
+
+#endif /* MPTCP_SCHEDULER_ROUND_ROBIN_H */
