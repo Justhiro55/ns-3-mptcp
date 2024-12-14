@@ -1676,8 +1676,8 @@ TcpSocketBase::DupAck ()
       // (1) If DupAcks >= DupThresh, go to step (4).
       if ((m_dupAckCount == m_retxThresh) && (m_highRxAckMark >= m_recover))
         {
-          EnterRecovery ();
-          NS_ASSERT (m_tcb->m_congState == TcpSocketState::CA_RECOVERY);
+          // EnterRecovery ();
+          // NS_ASSERT (m_tcb->m_congState == TcpSocketState::CA_RECOVERY);
         }
       // (2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true
       // (indicating at least three segments have arrived above the current
@@ -3382,6 +3382,7 @@ TcpSocketBase::SendPendingData (bool withAck)
 uint32_t
 TcpSocketBase::UnAckDataCount () const
 {
+  std::cout << "TCP UnAckDataCount" << std::endl;
   return m_tcb->m_highTxMark - m_txBuffer->HeadSequence ();
 }
 

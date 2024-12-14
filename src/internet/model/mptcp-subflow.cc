@@ -860,55 +860,41 @@ MpTcpSubflow::AppendDSSFin()
 }
 
 void MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader) {
-    NS_LOG_FUNCTION(this << tcpHeader);
+  // マッピング検索
+  MpTcpMapping mapping;
+  if (!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping)) {
+    NS_LOG_ERROR("No mapping found");
+    return; 
+  }
 
-    // マッピング検索  
-    MpTcpMapping mapping;
-    bool result = m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping);
-    if (!result) {
-        NS_LOG_ERROR("No mapping found for SSN=" << tcpHeader.GetSequenceNumber());
-        return;
-    }
+  // DSN整合性チェック
+  MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
+  
+  if (!dsnState.initialized) {
+    dsnState.Initialize(mapping.HeadDSN());
+    m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber());
+    return;
+  }
 
-    // メタソケットのDSN状態を取得
-    MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
-
-    // 初回データ受信時の初期化
-    if (!dsnState.initialized) {
-        dsnState.Initialize(mapping.HeadDSN());
-        if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
-            NS_LOG_WARN("Failed to add to rx buffer");
-        }
-        return;
-    }
-
-    // DSNギャップの検出
-    uint32_t gapSize = 0;
-    if (dsnState.HasGap(mapping.HeadDSN(), gapSize)) {
-        NS_LOG_WARN("DSN gap detected: expected=" << dsnState.expectedDsn 
-                    << " received=" << mapping.HeadDSN()
-                    << " gap=" << gapSize);
-        
-        // OoOキューに追加して処理
-        GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
-        SendEmptyPacket(TcpHeader::ACK);
-        return;
-    }
-
-    // 順序通りのデータを受信
-    if (!m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
-        NS_LOG_WARN("Failed to add to rx buffer");
-        return;
-    }
-
-    // DSN状態の更新
-    dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
-
-    if (!m_shutdownRecv) {
-        GetMeta()->OnSubflowRecv(this);
-    }
-
+  // DSNギャップの検出
+  uint32_t gapSize;
+  if (dsnState.HasGap(mapping.HeadDSN(), gapSize)) {
+    // OoOキューに追加
+    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
+    
+    // データACKを含まずにACKを返す
     SendEmptyPacket(TcpHeader::ACK);
+    return;
+  }
+
+  // 順序通りのデータを処理
+  if (m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
+    // dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
+    dsnState.expectedDsn = mapping.HeadDSN() + mapping.GetLength();
+    GetMeta()->OnSubflowRecv(this);
+  }
+
+  SendEmptyPacket(TcpHeader::ACK);
 }
 
 uint32_t
@@ -922,12 +908,8 @@ uint32_t
 MpTcpSubflow::BytesInFlight() const
 {
   NS_LOG_FUNCTION (this);
-
-  /*
-  Todo
-  - バッファから直接BytesInFlightを計算
-  */
   return 0;
+
   if (!m_txBuffer || m_state == CLOSED || m_state == LISTEN || m_state == SYN_SENT) {
     NS_LOG_WARN("Invalid state for BytesInFlight calculation");
     return 0;
@@ -1037,6 +1019,7 @@ MpTcpSubflow::ProcessOptionMpTcpDSSEstablished(const Ptr<const TcpOptionMpTcpDSS
 
   if(dss->GetFlags() & TcpOptionMpTcpDSS::DataAckPresent)
   {
+    std::cout << "processoptionmpdss: " << std::endl;
     GetMeta()->ReceivedAck(SequenceNumber32(dss->GetDataAck()), this, false);
   }
 

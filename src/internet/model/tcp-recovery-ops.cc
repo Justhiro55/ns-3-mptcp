@@ -91,6 +91,7 @@ void
 TcpClassicRecovery::EnterRecovery (Ptr<TcpSocketState> tcb, uint32_t dupAckCount,
                                 uint32_t unAckDataCount, uint32_t lastSackedBytes)
 {
+  std::cout << "enter recovery" << std::endl;
   NS_LOG_FUNCTION (this << tcb << dupAckCount << unAckDataCount << lastSackedBytes);
   NS_UNUSED (unAckDataCount);
   NS_UNUSED (lastSackedBytes);

@@ -210,6 +210,10 @@ public:
    */
   virtual void ForwardUp (Ptr<Packet> packet, Ipv4Header header, uint16_t port, Ptr<Ipv4Interface> incomingInterface);
 
+  Time GetRtt() const { 
+    return m_rtt->GetEstimate();
+  }
+
 protected:
   friend class MpTcpSocketBase;
   /**
