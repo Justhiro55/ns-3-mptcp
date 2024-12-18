@@ -281,20 +281,23 @@ MpTcpSubflow::SendPacket(TcpHeader header, Ptr<Packet> p)
   m_dssFlags = 0; // reset for next packet
 }
 
-uint32_t
+uint32_t 
 MpTcpSubflow::SendDataPacket(SequenceNumber32 ssnHead, uint32_t maxSize, bool withAck)
 {
-  NS_LOG_FUNCTION(this << "Sending packet starting at SSN [" << ssnHead.GetValue() << "] with len=" << maxSize<< withAck);
+  NS_LOG_FUNCTION(this << "Sending packet starting at SSN [" << ssnHead.GetValue() 
+                      << "] with len=" << maxSize << withAck);
+
   MpTcpMapping mapping;
   bool result = m_TxMappings.GetMappingForSSN(ssnHead, mapping);
-  if (!result)
-    {
-      m_TxMappings.Dump();
-      NS_FATAL_ERROR("Could not find mapping associated to ssn");
-    }
+  if (!result) {
+    m_TxMappings.Dump();
+    NS_FATAL_ERROR("Could not find mapping associated to ssn");
+  }
+
   AppendDSSMapping(mapping);
-  // Here we set the maxsize to the size of the mapping
-  return TcpSocketBase::SendDataPacket(ssnHead, std::min( (int)maxSize,mapping.TailSSN()-ssnHead+1), withAck);
+  return TcpSocketBase::SendDataPacket(ssnHead, 
+                                     std::min((int)maxSize, mapping.TailSSN()-ssnHead+1),
+                                     withAck);
 }
 
 bool
@@ -859,42 +862,70 @@ MpTcpSubflow::AppendDSSFin()
   m_dssFlags |= TcpOptionMpTcpDSS::DataFin;
 }
 
-void MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader) {
-  // マッピング検索
+void 
+MpTcpSubflow::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader) {
   MpTcpMapping mapping;
   if (!m_RxMappings.GetMappingForSSN(tcpHeader.GetSequenceNumber(), mapping)) {
-    NS_LOG_ERROR("No mapping found");
-    return; 
+    return;
   }
 
-  // DSN整合性チェック
   MpTcpSocketBase::DsnState& dsnState = GetMeta()->GetDsnState();
   
-  if (!dsnState.initialized) {
-    dsnState.Initialize(mapping.HeadDSN());
-    m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber());
-    return;
-  }
+  if (GetMeta()->GetNActiveSubflows() >= 2) {
+    bool added = m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber());
+    if (added) {
+      if (!IsMaster()) {
+        // 遅いパスからデータを受信した場合
+        dsnState.waitingForSlowPath = false;
 
-  // DSNギャップの検出
-  uint32_t gapSize;
-  if (dsnState.HasGap(mapping.HeadDSN(), gapSize)) {
-    // OoOキューに追加
-    GetMeta()->ProcessOutOfOrder(p->Copy(), mapping, this);
-    
-    // データACKを含まずにACKを返す
+        // 0.5秒後に送信処理を実行
+        Simulator::Schedule(Seconds(0.5), &MpTcpSubflow::DoDelayedSend, this);
+
+        dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
+        GetMeta()->OnSubflowRecv(this);
+      } else {
+        // 早いパスからのデータ受信時は待ち状態に
+        dsnState.waitingForSlowPath = true;
+        dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
+        GetMeta()->OnSubflowRecv(this);
+      }
+    }
     SendEmptyPacket(TcpHeader::ACK);
-    return;
+  } else {
+    // 単一サブフローの場合は通常処理
+    bool added = m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber());
+    if (added) {
+      dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
+      GetMeta()->OnSubflowRecv(this);
+    }
+    SendEmptyPacket(TcpHeader::ACK);
   }
+}
 
-  // 順序通りのデータを処理
-  if (m_rxBuffer->Add(p, tcpHeader.GetSequenceNumber())) {
-    // dsnState.UpdateDsn(mapping.HeadDSN(), mapping.GetLength());
-    dsnState.expectedDsn = mapping.HeadDSN() + mapping.GetLength();
-    GetMeta()->OnSubflowRecv(this);
+// 遅延送信を実行する新しい関数
+void
+MpTcpSubflow::DoDelayedSend() 
+{
+  NS_LOG_FUNCTION(this);
+
+  // 1. まず遅いパスの新規データを送信
+  SendPendingData(false);
+
+  // 2. 早いパスから10個の新規データを送信
+  Ptr<MpTcpSubflow> fastPath = nullptr;
+  for (uint32_t i = 0; i < GetMeta()->GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> subflow = GetMeta()->GetSubflow(i);
+    if (subflow->IsMaster()) {
+      fastPath = subflow;
+      break;
+    }
   }
-
-  SendEmptyPacket(TcpHeader::ACK);
+  
+  if (fastPath) {
+    for (int i = 0; i < 10; i++) {
+      fastPath->SendPendingData(false);
+    }
+  }
 }
 
 uint32_t

@@ -314,7 +314,7 @@ protected:
   // MappingList
   MpTcpMappingContainer m_TxMappings;  //!< List of mappings to send
   MpTcpMappingContainer m_RxMappings;  //!< List of mappings to receive
-
+  void DoDelayedSend();
 private:
   // DSS関連
   uint8_t m_dssFlags;  

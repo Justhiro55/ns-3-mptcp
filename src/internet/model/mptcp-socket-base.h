@@ -134,12 +134,14 @@ public:
     SequenceNumber64 lastSeenDsn;    // 最後に見たDSN
     SequenceNumber64 expectedDsn;    // 次に期待するDSN
     bool initialized;                // 初期化済みフラグ
+    bool waitingForSlowPath;         // 追加: Slow pathからのデータ待ち状態
 
     DsnState() :
       globalDsn(0),
       lastSeenDsn(0),
       expectedDsn(0),
-      initialized(false)
+      initialized(false),
+      waitingForSlowPath(false)      // 初期化子も追加
     {}
 
     // DSNの連続性をチェック
@@ -174,14 +176,13 @@ public:
     // DSN更新
     void UpdateDsn(SequenceNumber64 dsn, uint32_t length) {
         // 期待するDSNと完全一致する場合のみ更新
-        if (dsn == expectedDsn) {
-            lastSeenDsn = dsn;
-            expectedDsn = dsn + length;
-            if (dsn > globalDsn) {
-                globalDsn = dsn;
-            }
-            return;
+      if (dsn == expectedDsn) {
+        lastSeenDsn = dsn;
+        expectedDsn = dsn + length;
+        if (dsn > globalDsn) {
+          globalDsn = dsn;
         }
+      }
         // // 期待値と異なる場合はDSNを更新せず、ギャップを通知
         // uint32_t gapSize = dsn.GetValue() - expectedDsn.GetValue();
         // NotifyDsnGap(expectedDsn, dsn);

@@ -3223,8 +3223,8 @@ TcpSocketBase::UpdateRttHistory (const SequenceNumber32 &seq, uint32_t sz,
 uint32_t
 TcpSocketBase::SendPendingData (bool withAck)
 {
-  NS_LOG_FUNCTION (this << withAck);
-  if (m_txBuffer->Size () == 0)
+  cout << "Sendpendingdata: " << this << ": "<< withAck << std::endl;
+  if (m_txBuffer->Size () == 0 || withAck == false)
     {
       return false;                           // Nothing to send
     }

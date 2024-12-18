@@ -295,13 +295,8 @@ MpTcpSocketBase::Send(Ptr<Packet> p, uint32_t flags)
   // NS_LOG_FUNCTION(this);
   //! This will check for established state
   // OoOキューのサイズを正確に取得
-  size_t queueSize = m_ofoQueue.size();
-  NS_LOG_INFO("Out-of-order queue size: " << queueSize);
+  // NS_LOG_INFO("Out-of-order queue size: " << queueSize);
 
-  if (queueSize > 0) {
-    NS_LOG_INFO("Out-of-order queue is not empty");
-    return 0;
-  }
   return TcpSocketBase::Send(p,flags);
 }
 
@@ -873,26 +868,6 @@ MpTcpSocketBase::SendPendingData(bool withAck)
 {
   NS_LOG_FUNCTION(this << "Sending data" << TcpStateName[m_state]);
 
-  // OoOキューの確認を最初に行う
-  // OoOキューのサイズを正確に取得
-  size_t queueSize = m_ofoQueue.size();
-  NS_LOG_INFO("Out-of-order queue size: " << queueSize);
-
-  if (queueSize > 0) {
-    NS_LOG_INFO("Out-of-order queue is not empty");
-    return 0;
-  }
-  if (!m_ofoQueue.empty()) {
-    std::cout << "Out-of-order queue not empty with size " << m_ofoQueue.size() << ", blocking transmission" << std::endl;
-    // OoOキューの処理を試みる
-    TryProcessOfoQueue();
-    
-    // キューが空になっていない場合は送信をブロック
-    if (!m_ofoQueue.empty()) {
-      return 0;
-    }
-  }
-
   // パスマネージャの初期化
   if (FullyEstablished() && !m_multipleSubflows) {
     if (m_pathManager == MpTcpSocketBase::Default) {
@@ -1456,54 +1431,29 @@ MpTcpSocketBase::CheckSubflowsForMissingData(SequenceNumber64 expectedDsn, Seque
 }
 
 void MpTcpSocketBase::ReceivedAck(SequenceNumber32 dack, Ptr<MpTcpSubflow> sf, bool count_dupacks) {
-  std::cout << "ReceivedAck" << std::endl;
   if (!sf || !m_txBuffer) {
-    NS_LOG_WARN("Invalid state in ReceivedAck");
     return;
   }
 
-  // // 同一DACKの重複処理防止  
-  // if (dack <= m_lastProcessedDack) {
-  //   NS_LOG_INFO("Duplicate DACK " << dack << " ignored");
-  //   return;
-  // }
-
-  // OoOキューの状態確認を強化
-  std::cout << "Out-of-order queue state:" << std::endl;
-  std::cout << "Queue size = " << m_ofoQueue.size() << std::endl;
-  DumpOfoQueue(); // キューの詳細な状態を出力
-
-  if (!m_ofoQueue.empty()) {
-    // キューがある場合は処理を試みる
-    std::cout << "Processing queued packets..." << std::endl;
-    
-    TryProcessOfoQueue();
-    
-    // 処理後もキューが残っている場合は送信をブロック
-    if (!m_ofoQueue.empty()) {
-      std::cout << "Queue still contains " << m_ofoQueue.size() 
-                << " packets, blocking transmission" << std::endl;
-      return;
-    }
-  }
-
-  // バッファ更新とDACK処理
+  // バッファ更新
   m_txBuffer->DiscardUpTo(dack);
   m_lastProcessedDack = dack;
 
-  // ウィンドウサイズ計算と送信可能判定
-  uint32_t availableWindow = Window();
-  uint32_t inFlight = BytesInFlight();
-
-  if (availableWindow <= inFlight) {
-    return;
-  }
-
-  // 各サブフローで送信を試みる
-  for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
-    Ptr<MpTcpSubflow> subflow = GetSubflow(i);
-    if (subflow->Window() > 0) {
-      subflow->SendPendingData(false);
+  // 複数サブフローがある場合のみ制御 
+  if (GetNActiveSubflows() >= 2) {
+    // Slow pathからのACK受信時
+    if (!sf->IsMaster()) {
+      m_dsnState.waitingForSlowPath = false;
+      // Fast pathの送信許可
+      for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+        Ptr<MpTcpSubflow> subflow = GetSubflow(i);
+        if (subflow->IsMaster()) {
+          subflow->SendPendingData(false);
+        }
+      }
+    } else {
+      // Fast pathからのACK受信時は待ち状態に
+      m_dsnState.waitingForSlowPath = true; 
     }
   }
 }
