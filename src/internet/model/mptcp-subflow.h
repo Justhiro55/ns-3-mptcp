@@ -23,17 +23,9 @@
 #ifndef MPTCP_SUBFLOW_H
 #define MPTCP_SUBFLOW_H
 
-#include "ns3/trace-source-accessor.h"
-#include "ns3/sequence-number.h"
-#include "ns3/rtt-estimator.h"
-#include "ns3/event-id.h"
-#include "ns3/packet.h"
-#include "ns3/tcp-socket.h"
-#include "ns3/ipv4-end-point.h"
-#include "ns3/ipv4-address.h"
 #include "ns3/tcp-socket-base.h"
-#include "ns3/tcp-header.h"
-#include "ns3/mptcp-mapping.h"
+#include "ns3/sequence-number.h"
+#include "mptcp-mapping.h"
 
 using namespace std;
 
@@ -42,7 +34,6 @@ namespace ns3 {
 class MpTcpSocketBase;
 class TcpOptionMpTcpDSS;
 class TcpOptionMpTcpMain;
-class TcpSocketBase;
 class TcpOptionMpTcpAddAddress;
 
 /**

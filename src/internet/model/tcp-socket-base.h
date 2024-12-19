@@ -54,7 +54,7 @@ class TcpTxBuffer;
 class TcpOption;
 class Ipv4Interface;
 class Ipv6Interface;
-
+class MpTcpSubflow;
 /**
  * \ingroup tcp
  *
