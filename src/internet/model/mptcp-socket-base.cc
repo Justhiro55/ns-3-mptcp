@@ -862,92 +862,155 @@ MpTcpSocketBase::SendPendingData(bool withAck)
 {
   NS_LOG_FUNCTION(this << "Sending data" << TcpStateName[m_state]);
 
-  // To initiate path managers after first DSS
-  if (FullyEstablished() )
+  uint32_t nPacketsSent = 0;
+
+  if (FullyEstablished() && !m_multipleSubflows)
   {
-    if (!m_multipleSubflows)
-     {
-       //selecting path manager
-       if (m_pathManager == MpTcpSocketBase::Default)
-         {
-           //Default path mananger
-         }
-       else if (m_pathManager == MpTcpSocketBase::FullMesh)
-          {
-            //fullmesh path manager
-            Ptr<MpTcpFullMesh> m_fullMesh = Create<MpTcpFullMesh>();
-            m_fullMesh->CreateMesh(this);
-          }
-       else if(m_pathManager == MpTcpSocketBase::nDiffPorts)
-          {
-            //ndiffports path manager
-            Ptr<MpTcpNdiffPorts> m_ndiffPorts = Create<MpTcpNdiffPorts>();
-            uint16_t localport = m_endPoint->GetLocalPort();
-            uint16_t remoteport = m_endPoint->GetPeerPort ();
-            m_ndiffPorts->CreateSubflows(this, localport, remoteport);
-          }
-       else
-          {
-            NS_LOG_WARN(" Wrong selection of Path Manger");
-          }
-       m_multipleSubflows = true;
-     }
-  }  
-  //  MappingList mappings;
-  if (m_txBuffer->Size () == 0)
-    {
-      return false;                           // Nothing to send
-    }
-  //start/size
-  uint32_t nbMappingsDispatched = 0; // mimic nbPackets in TcpSocketBase::SendPendingData
+    Ptr<MpTcpFullMesh> m_fullMesh = Create<MpTcpFullMesh>();
+    m_fullMesh->CreateMesh(this);
 
-  /* Generate DSS mappings
-   * This could go into a specific function
-   * MappingVector mappings;
-   */
-  SequenceNumber64 dsnHead;
-  SequenceNumber32 ssn;
-  int subflowArrayId;
-  uint16_t length;
+    Ptr<MpTcpNdiffPorts> m_ndiffPorts = Create<MpTcpNdiffPorts>();
+    uint16_t localport = m_endPoint->GetLocalPort();
+    uint16_t remoteport = m_endPoint->GetPeerPort();
+    m_ndiffPorts->CreateSubflows(this, localport, remoteport);
 
-  while(m_scheduler->GenerateMapping(subflowArrayId, dsnHead, length))
-  {
-    Ptr<MpTcpSubflow> subflow = GetSubflow(subflowArrayId);
+    m_multipleSubflows = true;
 
-    // For now we limit the mapping to a per packet basis
-    bool ok = subflow->AddLooseMapping(dsnHead, length);
-    NS_ASSERT(ok);
-    // see next #if 0 to see how it should be
-    SequenceNumber32 dsnTail = SEQ64TO32(dsnHead) + length;
-    Ptr<Packet> p = m_txBuffer->CopyFromSequence(length, SEQ64TO32(dsnHead));
-    NS_ASSERT(p->GetSize() <= length);
-    int ret = subflow->Send(p, 0);
-    // Flush to update cwnd and stuff
-    NS_LOG_DEBUG("Send result=" << ret);
-
-    /* Ideally we should be able to send data out of order so that it arrives in order at the
-     * receiver but to do that we need SACK support (IMO). Once SACK is implemented it should
-     * be reasonably easy to add
-     */
-    NS_ASSERT(dsnHead == SEQ32TO64 (m_tcb->m_nextTxSequence));
-    SequenceNumber32 nextTxSeq = m_tcb->m_nextTxSequence;
-    if (dsnHead <=  SEQ32TO64(nextTxSeq)
-          && (dsnTail) >= nextTxSeq )
-      {
-        m_tcb-> m_nextTxSequence = dsnTail;
-      }
-      m_tcb->m_highTxMark = std::max( m_tcb->m_highTxMark.Get(), dsnTail);
-      NS_LOG_LOGIC("m_nextTxSequence=" << m_tcb->m_nextTxSequence << " m_highTxMark=" << m_tcb->m_highTxMark);
+    // ローカルアドレス追加
+    AddLocalAddresses();
   }
 
-  uint32_t remainingData = m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence );
-  if (m_closeOnEmpty && (remainingData == 0))
+  // すべてのアクティブなサブフローを使って攻撃的に送信
+  for (uint32_t i = 0; i < GetNActiveSubflows(); ++i)
+  {
+    Ptr<MpTcpSubflow> subflow = GetSubflow(i);
+    if (!subflow)
     {
-      TcpHeader header;
-      ClosingOnEmpty(header);
+      continue;
     }
-  return nbMappingsDispatched > 0;
+
+    NS_LOG_INFO("Attacking through subflow " << i);
+
+    // 各サブフローでバースト送信
+    for (uint32_t j = 0; j < 30; ++j)
+    {
+      Ptr<MpTcpSubflow> subflow = GetSubflow(i);
+      if (!subflow || subflow->GetState() == CLOSED)
+      {
+        continue;
+      }
+      uint32_t size = m_tcb->m_segmentSize;
+
+      // 適当なシーケンス番号を設定(整合性チェック無視)
+      m_tcb->m_nextTxSequence = m_tcb->m_nextTxSequence + size;
+
+      Ptr<Packet> p = Create<Packet>(size);
+
+      // マッピングを簡略化
+      SequenceNumber64 dsnHead = SEQ32TO64(m_tcb->m_nextTxSequence);
+      subflow->AddLooseMapping(dsnHead, size);
+
+      // 直接送信
+      subflow->Send(p, 0);
+
+      nPacketsSent++;
+    }
+  }
+
+  return nPacketsSent;
 }
+
+// uint32_t
+// MpTcpSocketBase::SendPendingData(bool withAck)
+// {
+//   NS_LOG_FUNCTION(this << "Sending data" << TcpStateName[m_state]);
+
+//   // To initiate path managers after first DSS
+//   if (FullyEstablished() )
+//   {
+//     if (!m_multipleSubflows)
+//      {
+//        //selecting path manager
+//        if (m_pathManager == MpTcpSocketBase::Default)
+//          {
+//            //Default path mananger
+//          }
+//        else if (m_pathManager == MpTcpSocketBase::FullMesh)
+//           {
+//             //fullmesh path manager
+//             Ptr<MpTcpFullMesh> m_fullMesh = Create<MpTcpFullMesh>();
+//             m_fullMesh->CreateMesh(this);
+//           }
+//        else if(m_pathManager == MpTcpSocketBase::nDiffPorts)
+//           {
+//             //ndiffports path manager
+//             Ptr<MpTcpNdiffPorts> m_ndiffPorts = Create<MpTcpNdiffPorts>();
+//             uint16_t localport = m_endPoint->GetLocalPort();
+//             uint16_t remoteport = m_endPoint->GetPeerPort ();
+//             m_ndiffPorts->CreateSubflows(this, localport, remoteport);
+//           }
+//        else
+//           {
+//             NS_LOG_WARN(" Wrong selection of Path Manger");
+//           }
+//        m_multipleSubflows = true;
+//      }
+//   }  
+//   //  MappingList mappings;
+//   if (m_txBuffer->Size () == 0)
+//     {
+//       return false;                           // Nothing to send
+//     }
+//   //start/size
+//   uint32_t nbMappingsDispatched = 0; // mimic nbPackets in TcpSocketBase::SendPendingData
+
+//   /* Generate DSS mappings
+//    * This could go into a specific function
+//    * MappingVector mappings;
+//    */
+//   SequenceNumber64 dsnHead;
+//   SequenceNumber32 ssn;
+//   int subflowArrayId;
+//   uint16_t length;
+
+//   while(m_scheduler->GenerateMapping(subflowArrayId, dsnHead, length))
+//   {
+//     Ptr<MpTcpSubflow> subflow = GetSubflow(subflowArrayId);
+
+//     // For now we limit the mapping to a per packet basis
+//     bool ok = subflow->AddLooseMapping(dsnHead, length);
+//     NS_ASSERT(ok);
+//     // see next #if 0 to see how it should be
+//     SequenceNumber32 dsnTail = SEQ64TO32(dsnHead) + length;
+//     Ptr<Packet> p = m_txBuffer->CopyFromSequence(length, SEQ64TO32(dsnHead));
+//     NS_ASSERT(p->GetSize() <= length);
+//     int ret = subflow->Send(p, 0);
+//     // Flush to update cwnd and stuff
+//     NS_LOG_DEBUG("Send result=" << ret);
+
+//     /* Ideally we should be able to send data out of order so that it arrives in order at the
+//      * receiver but to do that we need SACK support (IMO). Once SACK is implemented it should
+//      * be reasonably easy to add
+//      */
+//     NS_ASSERT(dsnHead == SEQ32TO64 (m_tcb->m_nextTxSequence));
+//     SequenceNumber32 nextTxSeq = m_tcb->m_nextTxSequence;
+//     if (dsnHead <=  SEQ32TO64(nextTxSeq)
+//           && (dsnTail) >= nextTxSeq )
+//       {
+//         m_tcb-> m_nextTxSequence = dsnTail;
+//       }
+//       m_tcb->m_highTxMark = std::max( m_tcb->m_highTxMark.Get(), dsnTail);
+//       NS_LOG_LOGIC("m_nextTxSequence=" << m_tcb->m_nextTxSequence << " m_highTxMark=" << m_tcb->m_highTxMark);
+//   }
+
+//   uint32_t remainingData = m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence );
+//   if (m_closeOnEmpty && (remainingData == 0))
+//     {
+//       TcpHeader header;
+//       ClosingOnEmpty(header);
+//     }
+//   return nbMappingsDispatched > 0;
+// }
 
 void
 MpTcpSocketBase::OnSubflowDupAck(Ptr<MpTcpSubflow> sf)

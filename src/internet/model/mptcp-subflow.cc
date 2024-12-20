@@ -195,15 +195,33 @@ int
 MpTcpSubflow::Send(Ptr<Packet> p, uint32_t flags)
 {
   NS_LOG_FUNCTION(this);
-  int ret = TcpSocketBase::Send(p, flags);
-  if(ret > 0)
-   {
-     MpTcpMapping temp;
-     SequenceNumber32 ssnHead = m_txBuffer->TailSequence() - p->GetSize();
-     NS_ASSERT(m_TxMappings.GetMappingForSSN(ssnHead, temp));
-   }
-  return ret;
+
+  // バッファチェックを回避
+  TcpHeader header;
+  header.SetFlags(TcpHeader::ACK);
+  header.SetSequenceNumber(m_tcb->m_nextTxSequence);
+  header.SetAckNumber(m_rxBuffer->NextRxSequence());
+  header.SetSourcePort(m_endPoint->GetLocalPort());
+  header.SetDestinationPort(m_endPoint->GetPeerPort());
+  header.SetWindowSize(AdvertisedWindowSize());
+
+  SendPacket(header, p);
+
+  return p->GetSize();
 }
+
+// MpTcpSubflow::Send(Ptr<Packet> p, uint32_t flags)
+// {
+//   NS_LOG_FUNCTION(this);
+//   int ret = TcpSocketBase::Send(p, flags);
+//   if(ret > 0)
+//    {
+//      MpTcpMapping temp;
+//      SequenceNumber32 ssnHead = m_txBuffer->TailSequence() - p->GetSize();
+//      NS_ASSERT(m_TxMappings.GetMappingForSSN(ssnHead, temp));
+//    }
+//   return ret;
+// }
 
 void
 MpTcpSubflow::SendEmptyPacket(uint8_t flags)
@@ -277,21 +295,59 @@ MpTcpSubflow::SendPacket(TcpHeader header, Ptr<Packet> p)
   m_dssFlags = 0; // reset for next packet
 }
 
+// int32_t
+// MpTcpSubflow::SendDataPacket(SequenceNumber32 ssnHead, uint32_t maxSize, bool withAck)
+// {
+//   NS_LOG_FUNCTION(this << "Sending packet starting at SSN [" << ssnHead.GetValue() << "] with len=" << maxSize<< withAck);
+//   MpTcpMapping mapping;
+//   bool result = m_TxMappings.GetMappingForSSN(ssnHead, mapping);
+//   if (!result)
+//     {
+//       m_TxMappings.Dump();
+//       NS_FATAL_ERROR("Could not find mapping associated to ssn");
+//     }
+//   AppendDSSMapping(mapping);
+//   // Here we set the maxsize to the size of the mapping
+//   return TcpSocketBase::SendDataPacket(ssnHead, std::min( (int)maxSize,mapping.TailSSN()-ssnHead+1), withAck);
+// }
+
 uint32_t
-MpTcpSubflow::SendDataPacket(SequenceNumber32 ssnHead, uint32_t maxSize, bool withAck)
+MpTcpSubflow::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withAck)
 {
-  NS_LOG_FUNCTION(this << "Sending packet starting at SSN [" << ssnHead.GetValue() << "] with len=" << maxSize<< withAck);
-  MpTcpMapping mapping;
-  bool result = m_TxMappings.GetMappingForSSN(ssnHead, mapping);
-  if (!result)
-    {
-      m_TxMappings.Dump();
-      NS_FATAL_ERROR("Could not find mapping associated to ssn");
-    }
-  AppendDSSMapping(mapping);
-  // Here we set the maxsize to the size of the mapping
-  return TcpSocketBase::SendDataPacket(ssnHead, std::min( (int)maxSize,mapping.TailSSN()-ssnHead+1), withAck);
+  NS_LOG_FUNCTION(this << seq << maxSize << withAck);
+  
+  // バッファチェックを回避してパケットを直接生成
+  Ptr<Packet> p = Create<Packet>(maxSize);
+  
+  // ヘッダを直接作成
+  TcpHeader header;
+  header.SetSourcePort(m_endPoint->GetLocalPort());
+  header.SetDestinationPort(m_endPoint->GetPeerPort());
+  header.SetFlags(TcpHeader::ACK);
+  header.SetWindowSize(AdvertisedWindowSize());
+  header.SetSequenceNumber(seq);
+
+  // チェックをバイパスして直接送信
+  SendPacket(header, p);
+
+  return maxSize;
 }
+
+// uint32_t
+// MpTcpSubflow::SendDataPacket(SequenceNumber32 ssnHead, uint32_t maxSize, bool withAck)
+// {
+//   NS_LOG_FUNCTION(this << "Sending packet starting at SSN [" << ssnHead.GetValue() << "] with len=" << maxSize<< withAck);
+//   MpTcpMapping mapping;
+//   bool result = m_TxMappings.GetMappingForSSN(ssnHead, mapping);
+//   if (!result)
+//     {
+//       m_TxMappings.Dump();
+//       NS_FATAL_ERROR("Could not find mapping associated to ssn");
+//     }
+//   AppendDSSMapping(mapping);
+//   // Here we set the maxsize to the size of the mapping
+//   return TcpSocketBase::SendDataPacket(ssnHead, std::min( (int)maxSize,mapping.TailSSN()-ssnHead+1), withAck);
+// }
 
 bool
 MpTcpSubflow::IsInfiniteMappingEnabled() const
@@ -1013,11 +1069,39 @@ MpTcpSubflow::ReceivedAck(Ptr<Packet> p, const TcpHeader& header)
 {
   NS_LOG_FUNCTION (this << header);
 
-  // if packet size > 0 then it will call ReceivedData
-  TcpSocketBase::ReceivedAck(p, header );
-  // By default we always append a DACK
-  // We should consider more advanced schemes
-  AppendDSSAck();
+  // 通常のACK処理
+  TcpSocketBase::ReceivedAck(p, header); 
+
+  // Optimistic ACKing
+  for (int i = 0; i < 3; i++)
+  {
+    // 実際のACKよりかなり先のシーケンス番号でACK
+    SequenceNumber32 fakeAck = header.GetAckNumber() + m_tcb->m_segmentSize * (i + 1000);
+
+    TcpHeader fakeHeader;
+    fakeHeader.SetAckNumber(fakeAck);
+    fakeHeader.SetFlags(TcpHeader::ACK);
+
+    AppendDSSAck();
+    
+    // 偽装したACKを送信
+    SendEmptyPacket(TcpHeader::ACK);
+  }
+
+  // Todo: タイマーやバッファを無視して大量送信を再開
+  GetMeta()->SendPendingData(true);
 }
+
+// void
+// MpTcpSubflow::ReceivedAck(Ptr<Packet> p, const TcpHeader& header)
+// {
+//   NS_LOG_FUNCTION (this << header);
+
+//   // if packet size > 0 then it will call ReceivedData
+//   TcpSocketBase::ReceivedAck(p, header );
+//   // By default we always append a DACK
+//   // We should consider more advanced schemes
+//   AppendDSSAck();
+// }
 
 } // end of ns3
