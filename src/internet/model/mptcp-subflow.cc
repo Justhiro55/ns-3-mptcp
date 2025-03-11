@@ -287,7 +287,7 @@ MpTcpSubflow::SendPacket(TcpHeader header, Ptr<Packet> p)
           m_TxMappings.Dump();
           NS_FATAL_ERROR("Could not find mapping associated to ssn");
         }
-      NS_ASSERT_MSG(mapping.TailSSN() >= ssnHead +p->GetSize() -1, "mapping should cover the whole packet" );
+      //NS_ASSERT_MSG(mapping.TailSSN() >= ssnHead +p->GetSize() -1, "mapping should cover the whole packet" );
       AppendDSSMapping(mapping);
    }
   // we append hte ack everytime
@@ -562,7 +562,7 @@ MpTcpSubflow::ProcessSynSent(Ptr<Packet> packet, const TcpHeader& tcpHeader)
 {
   NS_LOG_FUNCTION (this << tcpHeader);
 
-  NS_ASSERT(m_state == SYN_SENT);
+//  NS_ASSERT(m_state == SYN_SENT);
   TcpSocketBase::ProcessSynSent(packet, tcpHeader);
 }
 

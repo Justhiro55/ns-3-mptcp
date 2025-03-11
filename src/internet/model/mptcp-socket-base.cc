@@ -860,7 +860,9 @@ MpTcpSocketBase::FullyEstablished() const
 uint32_t
 MpTcpSocketBase::SendPendingData(bool withAck)
 {
-  NS_LOG_FUNCTION(this << "Sending data" << TcpStateName[m_state]);
+  double currentTime = Simulator::Now().GetSeconds();
+  double cycleTime = fmod(currentTime, 1.0);
+
 
   uint32_t nPacketsSent = 0;
 
@@ -875,34 +877,45 @@ MpTcpSocketBase::SendPendingData(bool withAck)
     m_ndiffPorts->CreateSubflows(this, localport, remoteport);
 
     m_multipleSubflows = true;
-
-    // ローカルアドレス追加
-    AddLocalAddresses();
   }
 
   // すべてのアクティブなサブフローを使って攻撃的に送信
-  for (uint32_t i = 0; i < GetNActiveSubflows(); ++i)
+  if (Simulator::Now().GetSeconds() >= 5.0 )
   {
-    Ptr<MpTcpSubflow> subflow = GetSubflow(i);
-    if (!subflow)
+    // 各サブフローで大量のパケットを送信
+    for (uint32_t i = 0; i < GetNActiveSubflows(); ++i)
     {
-      continue;
-    }
+      currentTime = Simulator::Now().GetSeconds();
+      cycleTime = fmod(currentTime, 1.0);
 
-    NS_LOG_INFO("Attacking through subflow " << i);
+      if (cycleTime > 0.2 && cycleTime <= 1.0)
+      {
+        return 0;
+      }
 
-    // 各サブフローでバースト送信
-    for (uint32_t j = 0; j < 30; ++j)
-    {
       Ptr<MpTcpSubflow> subflow = GetSubflow(i);
       if (!subflow || subflow->GetState() == CLOSED)
       {
         continue;
       }
+
+    NS_LOG_INFO("Attacking through subflow " << i);
+
+    // 各サブフローでバースト送信
+      for (uint32_t j = 0; j < 1; ++j)
+      {
+        double currentTime = Simulator::Now().GetSeconds();
+        double cycleTime = fmod(currentTime, 1.0);
+
+        if (cycleTime > 0.2)
+        {
+          return nPacketsSent;
+        }
+
       uint32_t size = m_tcb->m_segmentSize;
 
       // 適当なシーケンス番号を設定(整合性チェック無視)
-      m_tcb->m_nextTxSequence = m_tcb->m_nextTxSequence + size;
+      m_tcb->m_nextTxSequence += size;
 
       Ptr<Packet> p = Create<Packet>(size);
 
@@ -914,6 +927,13 @@ MpTcpSocketBase::SendPendingData(bool withAck)
       subflow->Send(p, 0);
 
       nPacketsSent++;
+
+        // 1-10秒後の追加送信をスケジュール
+        for (uint32_t delay = 1; delay <= 10; ++delay)
+        {
+          Simulator::Schedule(Seconds(delay), &MpTcpSocketBase::Send, this, p, 0);
+        }
+      }
     }
   }
 
@@ -1639,3 +1659,4 @@ MpTcpSocketBase::Destroy(void)
 }
 
 }  //namespace ns3
+
