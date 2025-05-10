@@ -31,6 +31,8 @@
 #include "ns3/mptcp-scheduler-round-robin.h"
 #include "ns3/mptcp-fullmesh.h"
 #include "ns3/mptcp-ndiffports.h"
+#include "mptcp-subflow.h"
+#include <algorithm>
 
 namespace ns3 {
 
@@ -108,6 +110,8 @@ public:
    * \brief Should be called only by subflows when they update their receiver window
    */
   virtual bool UpdateWindowSize(const TcpHeader& header);
+  void NotifyDsnGap(SequenceNumber64 expected, SequenceNumber64 received);
+  void CheckSubflowsForMissingData(SequenceNumber64 expectedDsn, SequenceNumber64 receivedDsn);
 
 protected:
    ////////////////////////////////////////////
@@ -125,7 +129,84 @@ protected:
   virtual void OnSubflowConnectionSuccess (Ptr<Socket> socket);
 
 public:
+  struct DsnState {
+    SequenceNumber64 globalDsn;      // グローバルDSN
+    SequenceNumber64 lastSeenDsn;    // 最後に見たDSN
+    SequenceNumber64 expectedDsn;    // 次に期待するDSN
+    bool initialized;                // 初期化済みフラグ
+    bool waitingForSlowPath;         // 追加: Slow pathからのデータ待ち状態
 
+    DsnState() :
+      globalDsn(0),
+      lastSeenDsn(0),
+      expectedDsn(0),
+      initialized(false),
+      waitingForSlowPath(false)      // 初期化子も追加
+    {}
+
+    // DSNの連続性をチェック
+    bool IsNextExpectedDsn(SequenceNumber64 dsn) const {
+      return dsn == expectedDsn;
+    }
+
+    void Initialize(SequenceNumber64 dsn) {
+      if (!initialized) {
+        initialized = true;
+        expectedDsn = dsn;
+        lastSeenDsn = dsn;
+      }
+    }
+
+    bool HasGap(SequenceNumber64 dsn, uint32_t& gapSize) const {
+        if (!initialized) {
+            return false;
+        }
+
+        // 期待DSNとの差分を計算
+        if (dsn > expectedDsn) {
+            gapSize = dsn.GetValue() - expectedDsn.GetValue();
+            return true;
+        }
+
+        // 期待DSNと一致または以前のデータは正常とみなす
+        return false;
+    }
+
+
+    // DSN更新
+    void UpdateDsn(SequenceNumber64 dsn, uint32_t length) {
+        // 期待するDSNと完全一致する場合のみ更新
+      if (dsn == expectedDsn) {
+        lastSeenDsn = dsn;
+        expectedDsn = dsn + length;
+        if (dsn > globalDsn) {
+          globalDsn = dsn;
+        }
+      }
+        // // 期待値と異なる場合はDSNを更新せず、ギャップを通知
+        // uint32_t gapSize = dsn.GetValue() - expectedDsn.GetValue();
+        // NotifyDsnGap(expectedDsn, dsn);
+    }
+  };
+  DsnState& GetDsnState() { return m_dsnState; }
+
+struct OfoQueueItem {
+  Ptr<Packet> packet;
+  MpTcpMapping mapping;
+  Ptr<MpTcpSubflow> subflow;
+  
+  OfoQueueItem(Ptr<Packet> p, const MpTcpMapping& m, Ptr<MpTcpSubflow> sf)
+    : packet(p), mapping(m), subflow(sf) {}
+    
+  bool operator<(const OfoQueueItem& other) const {
+    return mapping.HeadDSN() < other.mapping.HeadDSN();
+  }
+};
+
+// 全サブフロー共通のOoOキュー
+std::set<OfoQueueItem> m_ofoQueue;
+
+  DsnState m_dsnState;
   virtual void SetPathManager(PathManagerMode); 
   /**
    * Create a subflow for ndiffports path manager
@@ -445,12 +526,7 @@ protected:
   virtual void ReTxTimeout (void);
   virtual void Retransmit();
   // MPTCP specfic version
-  virtual void ReceivedAck (
-    SequenceNumber32 dack
-  , Ptr<MpTcpSubflow> sf
-  , bool count_dupacks
-  );
-
+  virtual void ReceivedAck(SequenceNumber32 dack, Ptr<MpTcpSubflow> sf, bool count_dupacks);
   /**
    * \brief Part of the logic was implemented but this is non-working.
    * \return Always false
@@ -509,9 +585,11 @@ protected:
 
 private:
   uint64_t m_peerKey; //!< Store remote host token
-  bool     m_doChecksum;  //!< Compute the checksum. Negociated during 3WHS. Unused
+  bool     m_doChecksum;  //!< Compute the checksum. Negociated during 3WHS. Unused 
   bool     m_receivedDSS;  //!< True if we received at least one DSS
+  bool     m_outOfOrderDss;  // DSS out-of-orderを検出したフラグ  
   bool     m_multipleSubflows; //!< true if required number of subflows have been created [KN]
+  SequenceNumber32 m_lastProcessedDack;
   double   fLowStartTime;
 
   /* \brief Utility function used when a subflow changes state
@@ -533,6 +611,68 @@ private:
   //!
   TypeId m_subflowTypeId;
   TypeId m_schedulerTypeId;
+  SequenceNumber64 m_expectedDsn;
+
+  void ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTcpSubflow> subflow);
+
+void TryProcessOfoQueue() {
+  std::cout << "TryProcessOfoQueue called" << std::endl;
+  
+  if (m_ofoQueue.empty()) {
+    return;
+  }
+
+  bool progress = true;
+  while (progress && !m_ofoQueue.empty()) {
+    progress = false;
+
+    // setの先頭から順に処理
+    auto it = m_ofoQueue.begin();
+    while (it != m_ofoQueue.end()) {
+      // 期待するDSNと一致するか確認
+      if (it->mapping.HeadDSN() == m_dsnState.expectedDsn) {
+        // パケットをバッファに追加
+        if (it->subflow->m_rxBuffer->Add(it->packet, it->mapping.HeadSSN())) {
+          // DSN状態を更新
+          m_dsnState.expectedDsn = it->mapping.HeadDSN() + it->mapping.GetLength();
+          m_dsnState.lastSeenDsn = m_dsnState.expectedDsn;
+
+          // キューから削除して次へ
+          m_ofoQueue.erase(it++);
+          progress = true;
+
+          // アプリケーションに通知
+          NotifyDataRecv();
+        } else {
+          ++it;
+        }
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  if (!m_ofoQueue.empty()) {
+    std::cout << "OFO Queue still contains " << m_ofoQueue.size() << " packets" << std::endl;
+    std::cout << "Next expected DSN=" << m_dsnState.expectedDsn.GetValue() << std::endl;
+  }
+}
+
+public:
+  size_t GetOfoQueueSize() const {
+    return m_ofoQueue.size();
+  }
+
+  // OoOキューの状態を出力するメソッド 
+  void DumpOfoQueue() const {
+    std::cout << "Queue state (" << m_ofoQueue.size() << " packets):" << std::endl;
+    for (const auto& item : m_ofoQueue) {
+      std::cout << "- DSN=" << item.mapping.HeadDSN().GetValue()
+                << " Length=" << item.mapping.GetLength()
+                << " From=" << item.subflow << std::endl;
+    }
+  }
+
 };
 
 }   //namespace ns3

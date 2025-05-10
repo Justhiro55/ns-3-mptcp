@@ -125,7 +125,8 @@ MpTcpSocketBase::MpTcpSocketBase(const TcpSocketBase& sock)
     m_peerKey(0),
     m_doChecksum(false),
     m_receivedDSS(false),
-    m_multipleSubflows(false)
+    m_multipleSubflows(false),
+    m_lastProcessedDack(0)
 {
   NS_LOG_FUNCTION(this);
   NS_LOG_LOGIC("Copying from TcpSocketBase");
@@ -139,6 +140,7 @@ MpTcpSocketBase::MpTcpSocketBase(const MpTcpSocketBase& sock)
     m_doChecksum(sock.m_doChecksum),
     m_receivedDSS(sock.m_receivedDSS),
     m_multipleSubflows(sock.m_multipleSubflows),
+    m_lastProcessedDack(sock.m_lastProcessedDack),
     m_subflowConnectionSucceeded(sock.m_subflowConnectionSucceeded),
     m_subflowConnectionFailure(sock.m_subflowConnectionFailure),
     m_joinRequest(sock.m_joinRequest),
@@ -159,6 +161,7 @@ MpTcpSocketBase::MpTcpSocketBase()
     m_doChecksum(false),
     m_receivedDSS(false),
     m_multipleSubflows(false),
+    m_lastProcessedDack(0),
     fLowStartTime(0),
     m_subflowTypeId(MpTcpSubflow::GetTypeId ()),
     m_schedulerTypeId(MpTcpSchedulerRoundRobin::GetTypeId())
@@ -289,8 +292,11 @@ MpTcpSocketBase::SetPeerKey(uint64_t remoteKey)
 int
 MpTcpSocketBase::Send(Ptr<Packet> p, uint32_t flags)
 {
-  NS_LOG_FUNCTION(this);
+  // NS_LOG_FUNCTION(this);
   //! This will check for established state
+  // OoOキューのサイズを正確に取得
+  // NS_LOG_INFO("Out-of-order queue size: " << queueSize);
+
   return TcpSocketBase::Send(p,flags);
 }
 
@@ -862,90 +868,108 @@ MpTcpSocketBase::SendPendingData(bool withAck)
 {
   NS_LOG_FUNCTION(this << "Sending data" << TcpStateName[m_state]);
 
-  // To initiate path managers after first DSS
-  if (FullyEstablished() )
-  {
-    if (!m_multipleSubflows)
-     {
-       //selecting path manager
-       if (m_pathManager == MpTcpSocketBase::Default)
-         {
-           //Default path mananger
-         }
-       else if (m_pathManager == MpTcpSocketBase::FullMesh)
-          {
-            //fullmesh path manager
-            Ptr<MpTcpFullMesh> m_fullMesh = Create<MpTcpFullMesh>();
-            m_fullMesh->CreateMesh(this);
-          }
-       else if(m_pathManager == MpTcpSocketBase::nDiffPorts)
-          {
-            //ndiffports path manager
-            Ptr<MpTcpNdiffPorts> m_ndiffPorts = Create<MpTcpNdiffPorts>();
-            uint16_t localport = m_endPoint->GetLocalPort();
-            uint16_t remoteport = m_endPoint->GetPeerPort ();
-            m_ndiffPorts->CreateSubflows(this, localport, remoteport);
-          }
-       else
-          {
-            NS_LOG_WARN(" Wrong selection of Path Manger");
-          }
-       m_multipleSubflows = true;
-     }
-  }  
-  //  MappingList mappings;
-  if (m_txBuffer->Size () == 0)
-    {
-      return false;                           // Nothing to send
+  // パスマネージャの初期化
+  if (FullyEstablished() && !m_multipleSubflows) {
+    if (m_pathManager == MpTcpSocketBase::Default) {
+      //Default path mananger
     }
-  //start/size
-  uint32_t nbMappingsDispatched = 0; // mimic nbPackets in TcpSocketBase::SendPendingData
+    else if (m_pathManager == MpTcpSocketBase::FullMesh) {
+      //fullmesh path manager
+      Ptr<MpTcpFullMesh> m_fullMesh = Create<MpTcpFullMesh>();
+      m_fullMesh->CreateMesh(this);
+    }
+    else if(m_pathManager == MpTcpSocketBase::nDiffPorts) {
+      //ndiffports path manager
+      Ptr<MpTcpNdiffPorts> m_ndiffPorts = Create<MpTcpNdiffPorts>();
+      uint16_t localport = m_endPoint->GetLocalPort();
+      uint16_t remoteport = m_endPoint->GetPeerPort();
+      m_ndiffPorts->CreateSubflows(this, localport, remoteport);
+    }
+    else {
+      NS_LOG_WARN("Wrong selection of Path Manager");
+    }
+    m_multipleSubflows = true;
+  }
 
-  /* Generate DSS mappings
-   * This could go into a specific function
-   * MappingVector mappings;
-   */
+  // 送信バッファのチェック
+  if (m_txBuffer->Size() == 0) {
+    NS_LOG_DEBUG("Nothing to send in transmit buffer");
+    return 0;
+  }
+
+  // 利用可能なウィンドウのチェック
+  uint32_t availableWindow = Window();
+  uint32_t inFlight = BytesInFlight();
+  if (availableWindow <= inFlight) {
+    NS_LOG_DEBUG("No available window space - in flight: " << inFlight 
+                 << ", window: " << availableWindow);
+    return 0;
+  }
+
+  uint32_t nbMappingsDispatched = 0;
   SequenceNumber64 dsnHead;
   SequenceNumber32 ssn;
   int subflowArrayId;
   uint16_t length;
 
-  while(m_scheduler->GenerateMapping(subflowArrayId, dsnHead, length))
-  {
+  // マッピング生成と送信処理
+  while (m_scheduler->GenerateMapping(subflowArrayId, dsnHead, length)) {
     Ptr<MpTcpSubflow> subflow = GetSubflow(subflowArrayId);
 
-    // For now we limit the mapping to a per packet basis
+    // サブフローのウィンドウチェック
+    uint32_t subflowWindow = subflow->Window();
+    if (subflowWindow == 0) {
+      NS_LOG_DEBUG("Subflow " << subflowArrayId << " has no window space");
+      continue;
+    }
+
+    // マッピングの追加
     bool ok = subflow->AddLooseMapping(dsnHead, length);
-    NS_ASSERT(ok);
-    // see next #if 0 to see how it should be
+    if (!ok) {
+      NS_LOG_WARN("Failed to add mapping for subflow " << subflowArrayId);
+      continue;
+    }
+
+    // パケットの生成と送信
     SequenceNumber32 dsnTail = SEQ64TO32(dsnHead) + length;
     Ptr<Packet> p = m_txBuffer->CopyFromSequence(length, SEQ64TO32(dsnHead));
-    NS_ASSERT(p->GetSize() <= length);
-    int ret = subflow->Send(p, 0);
-    // Flush to update cwnd and stuff
-    NS_LOG_DEBUG("Send result=" << ret);
 
-    /* Ideally we should be able to send data out of order so that it arrives in order at the
-     * receiver but to do that we need SACK support (IMO). Once SACK is implemented it should
-     * be reasonably easy to add
-     */
-    NS_ASSERT(dsnHead == SEQ32TO64 (m_tcb->m_nextTxSequence));
-    SequenceNumber32 nextTxSeq = m_tcb->m_nextTxSequence;
-    if (dsnHead <=  SEQ32TO64(nextTxSeq)
-          && (dsnTail) >= nextTxSeq )
-      {
-        m_tcb-> m_nextTxSequence = dsnTail;
+    if (p->GetSize() > 0) {
+      // パケット送信
+      int ret = subflow->Send(p, 0);
+      NS_LOG_DEBUG("Send result=" << ret << " for subflow " << subflowArrayId);
+
+      if (ret > 0) {
+        nbMappingsDispatched++;
+
+        // シーケンス番号の更新
+        NS_ASSERT(dsnHead == SEQ32TO64(m_tcb->m_nextTxSequence));
+        SequenceNumber32 nextTxSeq = m_tcb->m_nextTxSequence;
+
+        if (dsnHead <= SEQ32TO64(nextTxSeq) && dsnTail >= nextTxSeq) {
+          m_tcb->m_nextTxSequence = dsnTail;
+        }
+
+        m_tcb->m_highTxMark = std::max(m_tcb->m_highTxMark.Get(), dsnTail);
+        NS_LOG_LOGIC("m_nextTxSequence=" << m_tcb->m_nextTxSequence
+                    << " m_highTxMark=" << m_tcb->m_highTxMark);
       }
-      m_tcb->m_highTxMark = std::max( m_tcb->m_highTxMark.Get(), dsnTail);
-      NS_LOG_LOGIC("m_nextTxSequence=" << m_tcb->m_nextTxSequence << " m_highTxMark=" << m_tcb->m_highTxMark);
+    }
   }
 
-  uint32_t remainingData = m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence );
-  if (m_closeOnEmpty && (remainingData == 0))
-    {
-      TcpHeader header;
-      ClosingOnEmpty(header);
-    }
+  // 終了処理
+  uint32_t remainingData = m_txBuffer->SizeFromSequence(m_tcb->m_nextTxSequence);
+  if (m_closeOnEmpty && (remainingData == 0)) {
+    TcpHeader header;
+    ClosingOnEmpty(header);
+  }
+
+  if (nbMappingsDispatched == 0) {
+    NS_LOG_DEBUG("No mappings were dispatched");
+  } else {
+    NS_LOG_DEBUG("Dispatched " << nbMappingsDispatched << " mappings");
+  }
+
   return nbMappingsDispatched > 0;
 }
 
@@ -972,38 +996,72 @@ MpTcpSocketBase::Retransmit()
 }
 
 void
-MpTcpSocketBase::DoRetransmit()
+MpTcpSocketBase::DoRetransmit(void)
 {
   NS_LOG_FUNCTION (this);
-  // Retransmit SYN packet
-  if (m_state == SYN_SENT)
-    {
-      if (m_synCount > 0)
-        {
-          NS_FATAL_ERROR("TODO, first syn didn't reach it should be resent. Maybe this shoudl be let to the subflow");
-        }
-      else
-        {
-          NotifyConnectionFailed();
-        }
-      return;
-    }
 
-  // Retransmit non-data packet: Only if in FIN_WAIT_1 or CLOSING state
-  if (m_txBuffer->Size() == 0)
-    {
-      if (m_state == FIN_WAIT_1 || m_state == CLOSING)
-        {
-          // Must have lost FIN, re-send
-          TcpHeader header;
-          SendFin();
-        }
-      return;
+  // 再送対象のサブフローを選択 
+  Ptr<MpTcpSubflow> subflow = nullptr;
+  Time minRtt = Time::Max();
+  
+  for(int i = 0; i < (int)GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    // TcpSocketBaseから継承したRTT推定値を使用
+    Time rtt = sf->m_rtt->GetEstimate();
+    if(rtt < minRtt) {
+      minRtt = rtt; 
+      subflow = sf;
     }
-  // Retransmit a data packet: Call SendDataPacket
-  NS_LOG_LOGIC ("TcpSocketBase " << this << " retxing seq " << m_txBuffer->HeadSequence ());
-  DumpRxBuffers(0);
-  NS_FATAL_ERROR("TODO later, but for the tests only, it should not be necesssary ?! Check for anything suspicious");
+  }
+
+  if(!subflow) {
+    NS_LOG_WARN("No suitable subflow for retransmission");
+    return;
+  }
+
+  // 再送データの準備
+  SequenceNumber32 seq = m_txBuffer->HeadSequence();
+  uint32_t size = m_txBuffer->SizeFromSequence(seq);
+
+  if(size == 0) {
+    NS_LOG_INFO("Nothing to retransmit");
+    return;
+  }
+
+  // マッピング情報を更新して再送 
+  MpTcpMapping mapping;
+  mapping.SetHeadDSN(SEQ32TO64(seq));
+  mapping.SetMappingSize(size);
+  mapping.MapToSSN(subflow->FirstUnmappedSSN());
+  
+  bool ok = subflow->AddLooseMapping(mapping.HeadDSN(), mapping.GetLength());
+  if(!ok) {
+    NS_LOG_ERROR("Could not add mapping for retransmission");
+    return;
+  }
+
+  // 再送データを選択したサブフローで送信
+  NS_LOG_INFO("Retransmitting " << size << " bytes on subflow " << subflow);
+  subflow->SendPendingData(true);
+
+  // 再送タイマーの更新
+  if (!m_retxEvent.IsExpired()) {
+    m_retxEvent.Cancel();
+  }
+
+  // TcpSocketBaseから継承したm_rtoを使用
+  m_retxEvent = Simulator::Schedule(subflow->m_rto.Get(), &MpTcpSocketBase::ReTxTimeout, this);
+
+  // 次の再送タイムアウト値を指数バックオフで計算
+  // TracedValueからTimeを取得して比較
+  Time currentRto = subflow->m_rto.Get();
+  Time maxRto = Seconds(60);
+  Time newRto = currentRto * 2;
+  
+  if (newRto > maxRto) {
+    newRto = maxRto;
+  }
+  subflow->m_rto = newRto;
 }
 
 void
@@ -1260,6 +1318,7 @@ MpTcpSocketBase::OnSubflowRetransmit(Ptr<MpTcpSubflow> sf)
 uint32_t
 MpTcpSocketBase::BytesInFlight() const
 {
+  return 0;
   NS_LOG_FUNCTION(this);
   return TcpSocketBase::BytesInFlight();
 }
@@ -1331,36 +1390,131 @@ MpTcpSocketBase::CloseAllSubflows()
   }
 }
 
-void
-MpTcpSocketBase::ReceivedAck(
-  SequenceNumber32 dack
-  , Ptr<MpTcpSubflow> sf
-  , bool count_dupacks
-  )
-{
-  NS_LOG_FUNCTION("Received DACK " << dack << "from subflow" << sf << "(Enable dupacks:" << count_dupacks << " )");
+void MpTcpSocketBase::NotifyDsnGap(SequenceNumber64 expected, SequenceNumber64 received) {
+  NS_LOG_WARN("DSN gap detected in subflow " <<
+              "Expected=" << expected << " Received=" << received);
 
-  if (dack < m_txBuffer->HeadSequence ())
-    { // Case 1: Old ACK, ignored.
-      NS_LOG_LOGIC ("Old ack Ignored " << dack  );
+  // 他のサブフローでギャップを埋められるか確認
+  for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    if (sf->HasDataInRange(expected, received)) {
+      NS_LOG_INFO("Found missing data in subflow " << i);
+      // そのサブフローからデータを取得
+      sf->ExtractDataInRange(expected, received);
+      return;
     }
-  else if (dack  == m_txBuffer->HeadSequence ())
-    { // Case 2: Potentially a duplicated ACK
-      if (dack  < m_tcb->m_nextTxSequence && count_dupacks)
-        {
-        /* dupackcount shall only be increased if there is only a DSS option ! */
+  }
+
+  // 見つからない場合は再送を要求
+  DoRetransmit();
+}
+
+void 
+MpTcpSocketBase::CheckSubflowsForMissingData(SequenceNumber64 expectedDsn, SequenceNumber64 receivedDsn)
+{
+  NS_LOG_FUNCTION(this << expectedDsn << receivedDsn);
+
+  // 他のサブフローでギャップを埋められるか確認
+  for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+    Ptr<MpTcpSubflow> sf = GetSubflow(i);
+    if (sf->HasDataInRange(expectedDsn, receivedDsn)) {
+      NS_LOG_INFO("Found missing data in subflow " << i);
+      // そのサブフローからデータを取得して処理
+      sf->ExtractDataInRange(expectedDsn, receivedDsn);
+      return;
+    }
+  }
+
+  // 見つからない場合は再送を要求
+  NS_LOG_WARN("Missing data not found in any subflow, requesting retransmission");
+  DoRetransmit();
+}
+
+void MpTcpSocketBase::ReceivedAck(SequenceNumber32 dack, Ptr<MpTcpSubflow> sf, bool count_dupacks) {
+  if (!sf || !m_txBuffer) {
+    return;
+  }
+
+  // バッファ更新
+  m_txBuffer->DiscardUpTo(dack);
+  m_lastProcessedDack = dack;
+
+  // 複数サブフローがある場合のみ制御 
+  if (GetNActiveSubflows() >= 2) {
+    // Slow pathからのACK受信時
+    if (!sf->IsMaster()) {
+      m_dsnState.waitingForSlowPath = false;
+      // Fast pathの送信許可
+      for (uint32_t i = 0; i < GetNActiveSubflows(); i++) {
+        Ptr<MpTcpSubflow> subflow = GetSubflow(i);
+        if (subflow->IsMaster()) {
+          subflow->SendPendingData(false);
         }
-      // otherwise, the ACK is precisely equal to the nextTxSequence
-      NS_ASSERT( dack  <= m_tcb->m_nextTxSequence);
+      }
+    } else {
+      // Fast pathからのACK受信時は待ち状態に
+      m_dsnState.waitingForSlowPath = true; 
     }
-  else if (dack  > m_txBuffer->HeadSequence ())
-    { // Case 3: New ACK, reset m_dupAckCount and update m_txBuffer
-      NS_LOG_LOGIC ("New DataAck [" << dack  << "]");
-      m_txBuffer->DiscardUpTo( dack );
-      bool resetRTO = true;
-      NewAck( dack, resetRTO );
-      m_dupAckCount = 0;
+  }
+}
+
+void MpTcpSocketBase::ProcessOutOfOrder(Ptr<Packet> packet, const MpTcpMapping& mapping, Ptr<MpTcpSubflow> subflow) {
+  NS_LOG_INFO("ProcessOutOfOrder called");
+  
+  if (!packet || !subflow) {
+    NS_LOG_ERROR("Invalid packet or subflow");
+    return;
+  }
+
+  SequenceNumber64 currentDsn = mapping.HeadDSN();
+
+  // expectedDsnより前のデータは破棄
+  if (currentDsn < m_dsnState.expectedDsn) {
+    NS_LOG_INFO("Dropping old data DSN=" << currentDsn.GetValue());
+    return;
+  }
+
+  // キュー追加前の状態を出力
+  std::cout << std::endl;
+  std::cout << "=============== New Out-of-order Packet ================";
+  std::cout << std::endl;
+  std::cout << " DSN=" << mapping.HeadDSN().GetValue() << std::endl;
+  std::cout << " Length=" << mapping.GetLength() << std::endl;
+  std::cout << " From subflow=" << subflow << std::endl;
+
+  // 古いデータのクリーンアップ
+  auto it = m_ofoQueue.begin();
+  while (it != m_ofoQueue.end()) {
+    if (it->mapping.HeadDSN() < m_dsnState.expectedDsn) {
+      it = m_ofoQueue.erase(it); 
+    } else {
+      ++it;
     }
+  }
+
+  // キューに追加して結果を確認
+  auto result = m_ofoQueue.insert(OfoQueueItem(packet->Copy(), mapping, subflow));
+  if (!result.second) {
+    NS_LOG_ERROR("Failed to insert packet into OFO queue");
+    return;
+  }
+
+  // 更新後のキュー状態を出力
+  std::cout << "Queue state (" << m_ofoQueue.size() << " packets):" << std::endl;
+  for (const auto& item : m_ofoQueue) {
+    std::cout << "- DSN=" << item.mapping.HeadDSN().GetValue()
+              << " Length=" << item.mapping.GetLength() 
+              << " From=" << item.subflow << std::endl;
+  }
+
+  std::cout << "Next expected DSN=" << m_dsnState.expectedDsn.GetValue() << std::endl;
+  std::cout << "==================================================" << std::endl;
+
+  // キューの処理を試行
+  if (!m_ofoQueue.empty()) {
+    NS_LOG_INFO("Attempting to process queued packets...");
+    TryProcessOfoQueue();
+  }
 }
 
 /* Move TCP to Time_Wait state and schedule a transition to Closed state */
